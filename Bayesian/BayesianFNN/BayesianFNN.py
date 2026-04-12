@@ -41,7 +41,7 @@ class BayesianLinear(nn.Module):
 
         return kl
 
-    def snr(self):
+    def get_snr(self):
         """
         Computes the Signal-to-Noise Ratio (SNR) for the layer.
     
@@ -61,6 +61,14 @@ class BayesianLinear(nn.Module):
             snr_b = torch.abs(self.mu_b) / (sigma_b +eps)
             snr = torch.cat((snr, snr_b.unsqueeze(1)), dim=1)
         return snr
+
+    def get_uncertainty(self):
+        var_w = F.softplus(self.rho_w) ** 2
+        if self.bias_flag:
+            var_b = F.softplus(self.rho_b) ** 2
+            uncertainty = torch.cat((var_w, var_b.unsqueeze(1)), dim=1)
+        return uncertainty
+        
 
 class BayesianFNN(nn.Module):
     def __init__(self, in_features, hidden_sizes, out_features):
@@ -99,9 +107,16 @@ class BayesianFNN(nn.Module):
     def get_average_snr_per_layer(self):
         average_snr_per_layer = []
         for layer in self.layers:
-            snr = layer.snr()
+            snr = layer.get_snr()
             average_snr_per_layer.append(torch.sum(snr)/snr.numel())
         return average_snr_per_layer
+
+    def get_average_uncertainty_per_layer(self):
+        average_uncertainty_per_layer = []
+        for layer in self.layers:
+            uncertainty = layer.get_uncertainty()
+            average_uncertainty_per_layer.append(torch.sum(uncertainty)/uncertainty.numel())
+        return average_uncertainty_per_layer
 
 
 def test_model_shape():
