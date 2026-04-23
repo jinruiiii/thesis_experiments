@@ -15,16 +15,16 @@ class BayesianLinear(nn.Module):
         if self.bias_flag:
             self.mu_b = nn.Parameter(torch.randn(out_features) * 0.1)
             self.rho_b = nn.Parameter(torch.ones(out_features) * -3)
-            
+
         self.prior = torch.distributions.Normal(0, 1)
 
     def forward(self, x):
-        sigma_w = torch.log1p(torch.exp(self.rho_w))
+        sigma_w = self._sigma(self.rho_w)
         eps_w = torch.randn_like(sigma_w)
         w = self.mu_w + sigma_w * eps_w
         
         if self.bias_flag:
-            sigma_b = torch.log1p(torch.exp(self.rho_b))
+            sigma_b = self._sigma(self.rho_b)
             eps_b = torch.randn_like(sigma_b)
             b = self.mu_b + sigma_b * eps_b
             return F.linear(x, w, b)
@@ -32,42 +32,34 @@ class BayesianLinear(nn.Module):
         return F.linear(x, w)
 
     def kl_loss(self):
-        posterior_w = torch.distributions.Normal(self.mu_w, torch.log1p(torch.exp(self.rho_w)))
+        posterior_w = torch.distributions.Normal(self.mu_w, self._sigma(self.rho_w))
         kl = torch.distributions.kl_divergence(posterior_w, self.prior).sum()
 
         if self.bias_flag:
-            posterior_b = torch.distributions.Normal(self.mu_b, torch.log1p(torch.exp(self.rho_b)))
+            posterior_b = torch.distributions.Normal(self.mu_b, self._sigma(self.rho_b))
             kl += torch.distributions.kl_divergence(posterior_b, self.prior).sum()
 
         return kl
 
     def get_snr(self):
-        """
-        Computes the Signal-to-Noise Ratio (SNR) for the layer.
-    
-        SNR is defined as |mu| / sigma for each weight and bias.
-    
-        Returns:
-            Tensor: 
-                - If bias is True: concatenated tensor of shape [out_features, in_features + 1]  containing SNRs for weights and biases.
-                - If bias is False: tensor of shape [out_features, in_features] containing SNRs for weights only.
-        """    
-        # numerical stability
         eps = 1e-8 
-        sigma_w = F.softplus(self.rho_w)
+        sigma_w = self._sigma(self.rho_w)
         snr = torch.abs(self.mu_w) / (sigma_w +eps)
         if self.bias_flag:
-            sigma_b = F.softplus(self.rho_b)
+            sigma_b = self._sigma(self.rho_b)
             snr_b = torch.abs(self.mu_b) / (sigma_b +eps)
             snr = torch.cat((snr, snr_b.unsqueeze(1)), dim=1)
         return snr
 
     def get_uncertainty(self):
-        var_w = F.softplus(self.rho_w) ** 2
+        var_w = self._sigma(self.rho_w) ** 2
         if self.bias_flag:
-            var_b = F.softplus(self.rho_b) ** 2
-            uncertainty = torch.cat((var_w, var_b.unsqueeze(1)), dim=1)
-        return uncertainty
+            var_b = self._sigma(self.rho_b) ** 2
+            return torch.cat((var_w, var_b.unsqueeze(1)), dim=1)
+        return var_w
+
+    def _sigma(self, rho):
+        return F.softplus(rho)
         
 
 class BayesianFNN(nn.Module):
@@ -86,7 +78,7 @@ class BayesianFNN(nn.Module):
 
     def forward(self, x):
         for layer in self.layers:
-            x = F.relu(layer(x))
+            x = F.silu(layer(x))
         x = self.out(x)
         return x
 
