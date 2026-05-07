@@ -68,17 +68,20 @@ class BayesianFNN(nn.Module):
         self.in_features = in_features
         self.hidden_sizes = hidden_sizes
         self.out_features = out_features
-
         self.layers = nn.ModuleList()
+        self.ln_layers = nn.ModuleList()
         prev_dim = in_features
         for current_dim in self.hidden_sizes:
             self.layers.append(BayesianLinear(prev_dim, current_dim))
+            self.ln_layers.append(nn.LayerNorm(current_dim))
             prev_dim = current_dim
         self.out = BayesianLinear(prev_dim, self.out_features)
 
     def forward(self, x):
-        for layer in self.layers:
-            x = F.silu(layer(x))
+        for layer, ln in zip(self.layers, self.ln_layers):
+            x = layer(x)
+            x = ln(x)
+            x = F.silu(x)
         x = self.out(x)
         return x
 

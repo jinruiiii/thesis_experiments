@@ -280,29 +280,29 @@ def neurogenesis(plasticity_original, hidden_sizes, exclude=[0], method="uncerta
     neurons_to_add  = None
     if method == "uncertainty":
         uncertainty = plasticity_original.get_average_uncertainty_per_layer()
-        print("\n Average Uncertainty per Hidden Layer:")
+        print("\n Average Normalised Uncertainty per Hidden Layer:")
         for i, val in enumerate(uncertainty):
-            print(f"  Layer {i+1}: {val.item():.4f}")
+            print(f"  Layer {i+1}: {val.item()/(hidden_sizes[i]**0.5):.6f}")
         layer_to_expand = max(
             (i for i in range(len(uncertainty)) if i not in exclude),
-            key=lambda i: uncertainty[i]
+            key=lambda i: uncertainty[i]/(hidden_sizes[i]**0.5)
         )
         neurons_to_add = max(1, int(hidden_sizes[layer_to_expand] * growth_rate))
         print(f"Expanding Layer {layer_to_expand+1} "
-              f"(Highest Uncertainty: {uncertainty[layer_to_expand].item():.4f}) "
+              f"(Highest Normalised Uncertainty: {uncertainty[layer_to_expand].item()/(hidden_sizes[layer_to_expand]**0.5):.6f}) "
               f"by {neurons_to_add} neurons")
     elif method == "snr":
         snr = plasticity_original.get_average_snr_per_layer()
         print("\n Average Signal-to-Noise Ratio per Hidden Layer:")
         for i, val in enumerate(snr):
-            print(f"  Layer {i+1}: {val.item():.4f}")
+            print(f"  Layer {i+1}: {val.item()/(hidden_sizes[i]**0.5):.6f}")
         layer_to_expand = min(
             (i for i in range(len(snr)) if i not in exclude),
-            key=lambda i: snr[i]
+            key=lambda i: snr[i]/(hidden_sizes[i]**0.5)
         )
         neurons_to_add = max(1, int(hidden_sizes[layer_to_expand] * growth_rate))
         print(f"Expanding Layer {layer_to_expand+1} "
-              f"(Lowest SNR: {snr[layer_to_expand].item():.4f}) "
+              f"(Lowest SNR: {snr[layer_to_expand].item()/(hidden_sizes[layer_to_expand]**0.5):.6f}) "
               f"by {neurons_to_add} neurons")
     else:
         raise ValueError(f"{method} not a defined method for neurogenesis.")
@@ -395,6 +395,16 @@ def truncate_and_load_encoder_layer(old_sd, keep_dict, new_layer):
                 if keep_i is not None:
                     w = w[keep_i]
             new_sd[key] = w
+
+        for p in ["weight", "bias"]:
+            key = f"ln_layers.{i}.{p}"
+            if key not in old_sd:
+                raise ValueError(f"{key} is missing in the plasticity model")
+            w = old_sd[key]
+            if keep_i is not None:
+                w = w[keep_i]
+            new_sd[key] = w
+
     for p in ["mu_w", "rho_w", "mu_b", "rho_b"]:
         key = f"out.{p}"
         if key not in old_sd:
@@ -404,6 +414,8 @@ def truncate_and_load_encoder_layer(old_sd, keep_dict, new_layer):
         if w.ndim == 2 and keep_last is not None:
             w = w[:, keep_last]
         new_sd[key] = w
+
+
     new_layer.load_state_dict(new_sd, strict=True)
 
 def naive_truncate_and_load_encoder_layer(old_sd, new_layer):
@@ -463,7 +475,7 @@ def run_experiment(experiment_name, model, train_loader, val_loader, test_loader
         metrics['val_acc'] = []
         metrics['val_brier'] = []
 
-    best_loss_total = float("inf")
+    best_nll = float("inf")
     best_model_state = None
     
     # Training loop
@@ -490,14 +502,14 @@ def run_experiment(experiment_name, model, train_loader, val_loader, test_loader
         print(f'Epoch {epoch}: Train Loss(ELBO)={train_loss_total:.4f}, Train Loss(NLL)={train_loss_nll:.4f}, Train Loss(KL)={train_loss_kl:.4f}, Train Acc={train_acc:.2f}%, Train Brier={train_brier:.3f}, '
               f'Val Loss(ELBO)={val_loss_total:.4f}, Val Loss(NLL)={val_loss_nll:.4f}, Val Loss(KL)={val_loss_kl:.4f}, Val Acc={val_acc:.2f}%, Val Brier={val_brier:.3f}')
         
-        if val_loss_total < best_loss_total:
-            best_loss_total = val_loss_total
+        if val_loss_nll < best_nll:
+            best_nll = val_loss_nll
             best_epoch = epoch
             best_model_state = copy.deepcopy(model.state_dict())
             torch.save(best_model_state, f'./results/{experiment_name}/best_model.pth')
             
         if early_stopper:
-            early_stopper.check_early_stop(val_loss_total)
+            early_stopper.check_early_stop(val_loss_nll)
             if early_stopper.stop_training:
                 break
 
@@ -536,6 +548,11 @@ def run_experiment(experiment_name, model, train_loader, val_loader, test_loader
         
         # Save model
         torch.save(model.state_dict(), f'./results/{experiment_name}/model.pth')
+
+        # get final architecture
+        hidden_sizes = []
+        for i, layer in enumerate(eval_model.layers):
+            hidden_sizes.append(layer.mu_w.shape[0])
         
         # Update metrics
         metrics.update({
@@ -546,6 +563,7 @@ def run_experiment(experiment_name, model, train_loader, val_loader, test_loader
             'test_brier': test_brier,
             'param_count': param_stats['total_params'],
             'trainable_param_count': param_stats.get('trainable_params', param_stats['total_params']),
+            'hidden_sizes': hidden_sizes
         })
         
         # Create a metrics DataFrame
@@ -687,7 +705,8 @@ def run_naive_plasticity_experiment(
 
     return metrics, plasticity_model
 
-def run_multi_growth_plasticity_experiment(
+
+def run_plasticity_experiment(
     experiment_name,
     plasticity_model,
     hidden_sizes,
@@ -698,198 +717,12 @@ def run_multi_growth_plasticity_experiment(
     cycles,
     learning_rate,
     beta,
-    growth_rate,
-    prune_thresholds,
-    patience,
-    delta,
-    search_epochs
-):
-    print("\n\n" + "="*50)
-    print(f"Training {experiment_name.upper()}")
-    print("="*50)
-
-    train_metrics = None
-    epochs_completed = 0
-
-    prev_val_loss_total = float("inf")
-
-    for i in range(1,cycles+1):
-        print("-"*20 + f" Cycle = {i} " + "-"*20)
-        print("+"*20 + " Growth Phase " + "+"*20)
-        while True:
-            remaining_epochs = max(0, (num_epochs//cycles)*i - epochs_completed)
-            if remaining_epochs == 0:
-                break
-            # =========================
-            # Stage 1: Initial training
-            # =========================
-            train_metrics, plasticity_model, epochs_run = run_experiment(
-                experiment_name,
-                plasticity_model,
-                train_loader,
-                val_loader,
-                test_loader,
-                remaining_epochs,
-                learning_rate,
-                start_epoch=1 + epochs_completed,
-                early_stopper=EarlyStopping(patience=patience, delta=delta),
-                metrics=train_metrics,
-                run_test=False,
-                beta=beta
-            )
-
-            # check if should stop growing
-            epochs_completed += epochs_run
-            current_best_val_loss_total = min(train_metrics["val_loss_total"])
-            improvement = prev_val_loss_total - current_best_val_loss_total
-            if improvement < 0.02:
-                break
-            prev_val_loss_total = current_best_val_loss_total
-
-            # =========================
-            # Stage 2: Growth (Neurogenesis)
-            # =========================
-            old_model = plasticity_model
-            new_model, hidden_sizes = neurogenesis(
-                old_model,
-                hidden_sizes,
-                exclude=[],
-                method="uncertainty",
-                growth_rate=growth_rate
-            )
-            expand_and_load_encoder_layer(old_model.state_dict(), new_model)
-            plasticity_model = new_model
-
-
-        # =========================
-        # Stage 3: Pruning search
-        # =========================
-
-        prune_thresholds = sorted(prune_thresholds)
-
-        best_threshold = None
-        best_val_loss = float("inf")
-
-        for threshold in prune_thresholds:
-            print("\n" + "-" * 20 + f" Pruning Search Phase (Threshold = {threshold})" + "-" * 20)  
-            keep_dict = neuroapoptosis(
-                plasticity_model,
-                threshold=threshold,
-                exclude=[],
-                method="snr",
-            )
-
-            if [] in keep_dict.values():
-                print(
-                    f"Prune threshold {threshold} too high; empty layers detected. "
-                    f"Skipping this and higher thresholds."
-                )
-                break
-
-            hidden_sizes = [len(v) for v in keep_dict.values()]
-
-            device = next(plasticity_model.parameters()).device
-            candidate_model = BayesianFNN(
-                plasticity_model.in_features,
-                hidden_sizes,
-                plasticity_model.out_features,
-            ).to(device)
-
-            truncate_and_load_encoder_layer(
-                plasticity_model.state_dict(),
-                keep_dict,
-                candidate_model,
-            )
-
-            prune_metrics, _, _ = run_experiment(
-                experiment_name,
-                candidate_model,
-                train_loader,
-                val_loader,
-                test_loader,
-                search_epochs,
-                learning_rate,
-                start_epoch=1,
-                metrics=None,
-                run_test=False,
-                beta=beta,
-            )
-
-            val_loss = min(prune_metrics["val_loss_total"])
-
-            if val_loss <= best_val_loss:
-                best_val_loss = val_loss
-                best_threshold = threshold
-
-        print(f"Best prune threshold: {best_threshold} | Val loss: {best_val_loss:.4f}")
-
-        # =========================
-        # Stage 4: Final pruning
-        # =========================
-        keep_dict = neuroapoptosis(
-            plasticity_model,
-            threshold=best_threshold,
-            exclude=[],
-            method="snr",
-        )
-
-        hidden_sizes = [len(v) for v in keep_dict.values()]
-
-        device = next(plasticity_model.parameters()).device
-        old_model = plasticity_model
-        plasticity_model = BayesianFNN(
-            old_model.in_features,
-            hidden_sizes,
-            old_model.out_features,
-        ).to(device)
-
-        truncate_and_load_encoder_layer(
-            old_model.state_dict(),
-            keep_dict,
-            plasticity_model,
-        )
-
-        if i != cycles:
-            continue
-
-        # =========================
-        # Stage 5: Final training
-        # =========================
-        remaining_epochs = max(0, (num_epochs//cycles)*i - epochs_completed)
-
-        if remaining_epochs > 0:
-            train_metrics, plasticity_model, epochs_run = run_experiment(
-                experiment_name,
-                plasticity_model,
-                train_loader,
-                val_loader,
-                test_loader,
-                remaining_epochs,
-                learning_rate,
-                start_epoch=1 + epochs_completed,
-                metrics=train_metrics,
-                run_test=True,
-                beta=beta,
-            )
-        epochs_completed += epochs_run
-
-    return train_metrics, plasticity_model
-
-def run_single_growth_plasticity_experiment(
-    experiment_name,
-    plasticity_model,
-    hidden_sizes,
-    train_loader,
-    val_loader,
-    test_loader,
-    num_epochs,
-    cycles,
-    learning_rate,
-    beta,
-    growth_epochs,
-    growth_rate,
-    prune_thresholds,
-    search_epochs
+    growth_steps_per_cycle=2,     
+    adapt_epochs_per_growth=10,  
+    growth_rate=1.0,
+    prune_thresholds=None,
+    search_epochs=5,
+    warmup_epochs=10
 ):
     print("\n" + "=" * 50)
     print(f"Training {experiment_name.upper()}")
@@ -900,86 +733,86 @@ def run_single_growth_plasticity_experiment(
 
     epochs_per_cycle = num_epochs // cycles
 
-    for i in range(1, cycles + 1):
-        print("-" * 20 + f" Cycle = {i} " + "-" * 20)
-        # =========================
-        # Stage 1: Initial training
-        # =========================
-        #print("\n" + "+" * 20 + " Growth Phase " + "+" * 20)
+    for cycle in range(1, cycles + 1):
 
-        if i == 1:
-            pre_growth_epochs = growth_epochs   # baseline training
-            post_growth_epochs = (epochs_per_cycle - pre_growth_epochs) // 2
-            post_prune_epochs = epochs_per_cycle - pre_growth_epochs - post_growth_epochs
-        else:
-            pre_growth_epochs = 0
-            post_growth_epochs = epochs_per_cycle // 2
-            post_prune_epochs = epochs_per_cycle - post_growth_epochs
+        print("-" * 20 + f" Cycle = {cycle} " + "-" * 20)
 
-        if i == 1:
-            base_epochs = growth_epochs
+        remaining_cycle_budget = epochs_per_cycle
+
+        if cycle == 1:
+
             train_metrics, plasticity_model, epochs_run = run_experiment(
                 experiment_name,
                 plasticity_model,
                 train_loader,
                 val_loader,
                 test_loader,
-                base_epochs,
+                warmup_epochs,
                 learning_rate,
-                start_epoch=1,
+                start_epoch=1 + epochs_completed,
                 metrics=train_metrics,
                 run_test=False,
                 beta=beta,
             )
 
             epochs_completed += epochs_run
+            remaining_cycle_budget -= epochs_run
 
-        # =========================
-        # Stage 2: Growth (Neurogenesis)
-        # =========================
-        old_model = plasticity_model
+        # -------------------------
+        # Growth → Train loop
+        # -------------------------
+        for g in range(growth_steps_per_cycle):
 
-        plasticity_model, hidden_sizes = neurogenesis(
-            old_model,
-            hidden_sizes,
-            exclude=[],
-            method="uncertainty",
-            growth_rate=growth_rate,
-        )
+            old_model = plasticity_model
 
-        expand_and_load_encoder_layer(old_model.state_dict(), plasticity_model)
+            plasticity_model, hidden_sizes = neurogenesis(
+                old_model,
+                hidden_sizes,
+                exclude=[],
+                method="uncertainty",
+                growth_rate=growth_rate,
+            )
 
-        # =========================
-        # Stage 3: Post-growth training
-        # =========================
+            expand_and_load_encoder_layer(
+                old_model.state_dict(),
+                plasticity_model
+            )
 
-        train_metrics, plasticity_model, epochs_run = run_experiment(
-            experiment_name,
-            plasticity_model,
-            train_loader,
-            val_loader,
-            test_loader,
-            post_growth_epochs,
-            learning_rate,
-            start_epoch=1 + epochs_completed,
-            metrics=train_metrics,
-            run_test=False,
-            beta=beta,
-        )
+            # adaptive training after growth
+            epochs_to_train = adapt_epochs_per_growth
 
-        epochs_completed += epochs_run
+            print(f"[Cycle {cycle} | Growth Step {g+1}] Training for {epochs_to_train} epochs")
 
-        # =========================
-        # Stage 4: Pruning search
-        # =========================
+            train_metrics, plasticity_model, epochs_run = run_experiment(
+                experiment_name,
+                plasticity_model,
+                train_loader,
+                val_loader,
+                test_loader,
+                epochs_to_train,
+                learning_rate,
+                start_epoch=1 + epochs_completed,
+                metrics=train_metrics,
+                run_test=False,
+                beta=beta,
+            )
+
+            epochs_completed += epochs_run
+            remaining_cycle_budget -= epochs_run
+
+        # -------------------------
+        # Pruning search phase
+        # -------------------------
+        print("\n" + "-" * 20 + " Pruning Search Phase " + "-" * 20)
 
         prune_thresholds = sorted(prune_thresholds)
 
         best_threshold = None
-        best_val_loss = float("inf")
+        best_nll = float("inf")
+        prev_keep_dict = None
 
         for threshold in prune_thresholds:
-            print("\n" + "-" * 20 + f" Pruning Search Phase (Threshold = {threshold})" + "-" * 20)  
+            print("\n" + "-" * 20 + f" Pruning Search Phase (Threshold = {threshold})" + "-" * 20)
             keep_dict = neuroapoptosis(
                 plasticity_model,
                 threshold=threshold,
@@ -994,9 +827,18 @@ def run_single_growth_plasticity_experiment(
                 )
                 break
 
+            if keep_dict == prev_keep_dict:
+                print(
+                    f"Prune threshold {threshold} results in same architecture as previous threshold. "
+                    f"Skipping to avoid redundant evaluation."
+                )
+                continue
+            prev_keep_dict = keep_dict
+
             hidden_sizes = [len(v) for v in keep_dict.values()]
 
             device = next(plasticity_model.parameters()).device
+
             candidate_model = BayesianFNN(
                 plasticity_model.in_features,
                 hidden_sizes,
@@ -1023,17 +865,17 @@ def run_single_growth_plasticity_experiment(
                 beta=beta,
             )
 
-            val_loss = min(prune_metrics["val_loss_total"])
+            val_nll = min(prune_metrics["val_loss_nll"])
 
-            if val_loss <= best_val_loss:
-                best_val_loss = val_loss
+            if val_nll <= best_nll:
+                best_nll = val_nll
                 best_threshold = threshold
 
-        print(f"Best prune threshold: {best_threshold} | Val loss: {best_val_loss:.4f}")
+        print(f"Best prune threshold: {best_threshold} | Val NLL: {best_nll:.4f}")
 
-        # =========================
-        # Stage 5: Final pruning
-        # =========================
+        # -------------------------
+        # Final pruning
+        # -------------------------
         keep_dict = neuroapoptosis(
             plasticity_model,
             threshold=best_threshold,
@@ -1044,6 +886,7 @@ def run_single_growth_plasticity_experiment(
         hidden_sizes = [len(v) for v in keep_dict.values()]
 
         device = next(plasticity_model.parameters()).device
+
         old_model = plasticity_model
         plasticity_model = BayesianFNN(
             old_model.in_features,
@@ -1057,50 +900,46 @@ def run_single_growth_plasticity_experiment(
             plasticity_model,
         )
 
-        # =========================
-        # Stage 6: Final training
-        # =========================
-
+        # -------------------------
+        # Post-prune training
+        # -------------------------
         train_metrics, plasticity_model, epochs_run = run_experiment(
             experiment_name,
             plasticity_model,
             train_loader,
             val_loader,
             test_loader,
-            post_prune_epochs,
+            remaining_cycle_budget,
             learning_rate,
             start_epoch=1 + epochs_completed,
             metrics=train_metrics,
             run_test=True,
             beta=beta,
         )
+
         epochs_completed += epochs_run
 
     return train_metrics, plasticity_model
 
 def main(save_path):
     # Hyperparameters
-    num_epochs = 300
-    cycles=3
+    num_epochs = 200
+    cycles=4
     batch_size = 1024
     learning_rate = 0.001
+    hidden_sizes = [512,256,128,64]
+    #hidden_sizes = [16,16,16,16]
     
-    # hidden_sizes = [1024,784,512,512]
-    # hidden_sizes = [256,128,64,32]
-    hidden_sizes = [16,16,16,16]
-    
-    beta=0.005
-    
-    # prune_threshold=1.6
-    # prune_threshold=1.7
-    prune_threshold=[1,2,3,4]
+    beta=0.1
+    prune_threshold=[0,0.25,0.5,0.75,1]
+    #prune_threshold=[1.5,1.75,2,2.5,3]
     
     growth_epochs = num_epochs//3
-    growth_rate = 1
+    growth_rate = 2
     patience=3
     delta=0.005
 
-    search_epochs = 30
+    search_epochs = 15
     
     # Create results directory
     os.makedirs(f'{save_path}', exist_ok=True)
@@ -1139,7 +978,7 @@ def main(save_path):
         train_dataset, 
         batch_size=batch_size, 
         shuffle=True, 
-        num_workers=1,
+        num_workers=4,
         drop_last=False,
         worker_init_fn=seed_worker,
         generator=g
@@ -1149,7 +988,7 @@ def main(save_path):
         val_dataset, 
         batch_size=batch_size, 
         shuffle=False, 
-        num_workers=1,
+        num_workers=4,
         worker_init_fn=seed_worker,
         generator=g
     )
@@ -1158,29 +997,29 @@ def main(save_path):
         test_dataset, 
         batch_size=batch_size, 
         shuffle=False, 
-        num_workers=1,
+        num_workers=4,
         worker_init_fn=seed_worker,
         generator=g
     )
     
     # ========== Experiment 1: Baseline Model ==========
-    print("\n\n" + "="*50)
-    print("Training Baseline Model")
-    print("="*50)
+    # print("\n\n" + "="*50)
+    # print("Training Baseline Model")
+    # print("="*50)
     baseline_model = BayesianFNN(784, hidden_sizes, 10).to(device)
     initial_state_dict = copy.deepcopy(baseline_model.state_dict())
-    # baseline_metrics, baseline_model, _= run_experiment(
-    #     'baseline', 
-    #     baseline_model, 
-    #     train_loader, 
-    #     val_loader, 
-    #     test_loader, 
-    #     num_epochs, 
-    #     learning_rate,
-    #     start_epoch=1,
-    #     run_test=True,
-    #     beta=beta
-    # )
+    baseline_metrics, baseline_model, _= run_experiment(
+        'baseline', 
+        baseline_model, 
+        train_loader, 
+        val_loader, 
+        test_loader, 
+        num_epochs, 
+        learning_rate,
+        start_epoch=1,
+        run_test=True,
+        beta=beta
+    )
     
     # # # ========== Experiment 2: Strong Baseline Model ==========
     # base_model = BayesianFNN(784, hidden_sizes, 10).to(device)
@@ -1195,15 +1034,15 @@ def main(save_path):
     #     num_epochs,
     #     learning_rate,
     #     beta,
-    #     growth_epochs,
+    #     66,
     #     growth_rate,
     # )
 
-    # ========== Experiment 3: Multi-Growth  ==========
+    # # ========== Experiment 3: Multi-Growth  ==========
     
     # base_model = BayesianFNN(784, hidden_sizes, 10).to(device)
     # base_model.load_state_dict(initial_state_dict)
-    # plasticity_multi_growth_metrics, _ = run_multi_growth_plasticity_experiment(
+    # plasticity_multi_growth_metrics, _ = run_plasticity_experiment(
     #     "plasticity_multi_growth",
     #     base_model,
     #     hidden_sizes,
@@ -1214,87 +1053,125 @@ def main(save_path):
     #     cycles,
     #     learning_rate,
     #     beta,
-    #     growth_rate,
-    #     prune_threshold,
-    #     patience,
-    #     delta,
-    #     search_epochs
+    #     growth_steps_per_cycle=3,
+    #     adapt_epochs_per_growth=10,
+    #     growth_rate=1,
+    #     prune_thresholds=prune_threshold,
+    #     search_epochs=search_epochs,
+    #     warmup_epochs=5
     # )
 
-    # # ========== Experiment 4: Single Growth ==========
+    # # # ========== Experiment 4: Single Growth ==========
 
-    base_model = BayesianFNN(784, hidden_sizes, 10).to(device)
-    base_model.load_state_dict(initial_state_dict)
-    plasticity_single_growth_metrics, _ = run_single_growth_plasticity_experiment(
-        "plasticity_single_growth",
-        base_model,
-        hidden_sizes,
-        train_loader,
-        val_loader,
-        test_loader,
-        num_epochs,
-        cycles,
-        learning_rate,
-        beta,
-        33,
-        growth_rate,
-        prune_threshold,
-        search_epochs
-    )
+    # base_model = BayesianFNN(784, hidden_sizes, 10).to(device)
+    # base_model.load_state_dict(initial_state_dict)
+    # plasticity_single_growth_metrics, _ = run_plasticity_experiment(
+    #     "plasticity_single_growth",
+    #     base_model,
+    #     hidden_sizes,
+    #     train_loader,
+    #     val_loader,
+    #     test_loader,
+    #     num_epochs,
+    #     cycles,
+    #     learning_rate,
+    #     beta,
+    #     growth_steps_per_cycle=1,
+    #     adapt_epochs_per_growth=40,
+    #     growth_rate=1.0,
+    #     prune_thresholds=prune_threshold,
+    #     search_epochs=search_epochs,
+    #     warmup_epochs=10
+    # )
     
     # # ========== Compare Results ==========
-    # # Combine all metrics
-    # all_metrics = {
-    #     'baseline': baseline_metrics,
-    #     'strong_baseline': strong_baseline_metrics,
-    #     'plasticity_multi_growth': plasticity_multi_growth_metrics,
-    #     'plasticity_single_growth': plasticity_single_growth_metrics
-    # }
-    # plot_metrics(all_metrics, save_path=f'./{save_path}/model_comparison.png')
+    # Combine all metrics
+    all_metrics = {
+         'baseline': baseline_metrics,
+        # 'strong_baseline': strong_baseline_metrics,
+        #'plasticity_multi_growth': plasticity_multi_growth_metrics,
+        # 'plasticity_single_growth': plasticity_single_growth_metrics
+    }
+    plot_metrics(all_metrics, save_path=f'./{save_path}/model_comparison.png')
     
-    # # Create summary table
-    # summary = pd.DataFrame([
-    #     {
-    #         'Model': 'Baseline',
-    #         'Parameters': baseline_metrics['param_count'],
-    #         'Trainable Params': baseline_metrics['trainable_param_count'],
-    #         'Best Val Acc': max(baseline_metrics['val_acc']),
-    #         'Best Val Brier': min(baseline_metrics['val_brier']),
-    #         'Test Acc': baseline_metrics['test_acc'],
-    #         'Test Brier': baseline_metrics['test_brier'],
-    #     },
-    #     {
-    #         'Model': 'Strong Baseline',
-    #         'Parameters': strong_baseline_metrics['param_count'],
-    #         'Trainable Params': strong_baseline_metrics['trainable_param_count'],
-    #         'Best Val Acc': max(strong_baseline_metrics['val_acc']),
-    #         'Best Val Brier': min(strong_baseline_metrics['val_brier']),
-    #         'Test Acc': strong_baseline_metrics['test_acc'],
-    #         'Test Brier': strong_baseline_metrics['test_brier'],
-    #     },
-    #     {
-    #         'Model': 'Plasticity Multi Growth',
-    #         'Parameters': plasticity_multi_growth_metrics['param_count'],
-    #         'Trainable Params': plasticity_multi_growth_metrics['trainable_param_count'],
-    #         'Best Val Acc': max(plasticity_multi_growth_metrics['val_acc']),
-    #         'Best Val Brier': min(plasticity_multi_growth_metrics['val_brier']),
-    #         'Test Acc': plasticity_multi_growth_metrics['test_acc'],
-    #         'Test Brier': plasticity_multi_growth_metrics['test_brier'],
-    #     },
-    #     {
-    #         'Model': 'Plasticity Single Growth',
-    #         'Parameters': plasticity_single_growth_metrics['param_count'],
-    #         'Trainable Params': plasticity_single_growth_metrics['trainable_param_count'],
-    #         'Best Val Acc': max(plasticity_single_growth_metrics['val_acc']),
-    #         'Best Val Brier': min(plasticity_single_growth_metrics['val_brier']),
-    #         'Test Acc': plasticity_single_growth_metrics['test_acc'],
-    #         'Test Brier': plasticity_single_growth_metrics['test_brier'],
-    #     }
-    # ])
+    # Create summary table
+    summary = pd.DataFrame([
+        {
+            'Model': 'Baseline',
+            'Parameters': baseline_metrics['param_count'],
+            'Trainable Params': baseline_metrics['trainable_param_count'],
+            'Best Val Acc': max(baseline_metrics['val_acc']),
+            'Best Val Brier': min(baseline_metrics['val_brier']),
+            'Test Acc': baseline_metrics['test_acc'],
+            'Test Brier': baseline_metrics['test_brier'],
+            'Hidden Sizes': baseline_metrics['hidden_sizes'],
+        },
+        # {
+        #     'Model': 'Strong Baseline',
+        #     'Parameters': strong_baseline_metrics['param_count'],
+        #     'Trainable Params': strong_baseline_metrics['trainable_param_count'],
+        #     'Best Val Acc': max(strong_baseline_metrics['val_acc']),
+        #     'Best Val Brier': min(strong_baseline_metrics['val_brier']),
+        #     'Test Acc': strong_baseline_metrics['test_acc'],
+        #     'Test Brier': strong_baseline_metrics['test_brier'],
+        #     'Hidden Sizes': strong_baseline_metrics['hidden_sizes'],
+        # },
+        # {
+        #     'Model': 'Plasticity Multi Growth',
+        #     'Parameters': plasticity_multi_growth_metrics['param_count'],
+        #     'Trainable Params': plasticity_multi_growth_metrics['trainable_param_count'],
+        #     'Best Val Acc': max(plasticity_multi_growth_metrics['val_acc']),
+        #     'Best Val Brier': min(plasticity_multi_growth_metrics['val_brier']),
+        #     'Test Acc': plasticity_multi_growth_metrics['test_acc'],
+        #     'Test Brier': plasticity_multi_growth_metrics['test_brier'],
+        #     'Hidden Sizes': plasticity_multi_growth_metrics['hidden_sizes'],
+        # },
+        # {
+        #     'Model': 'Plasticity Single Growth',
+        #     'Parameters': plasticity_single_growth_metrics['param_count'],
+        #     'Trainable Params': plasticity_single_growth_metrics['trainable_param_count'],
+        #     'Best Val Acc': max(plasticity_single_growth_metrics['val_acc']),
+        #     'Best Val Brier': min(plasticity_single_growth_metrics['val_brier']),
+        #     'Test Acc': plasticity_single_growth_metrics['test_acc'],
+        #     'Test Brier': plasticity_single_growth_metrics['test_brier'],
+        #     'Hidden Sizes': plasticity_single_growth_metrics['hidden_sizes'],
+        # }
+    ])
     
-    # summary.to_csv(f'./{save_path}/experiment_summary.csv', index=False)
-    # print("\nExperiment Summary:")
-    # print(summary)
-    # return summary
+    summary.to_csv(f'./{save_path}/experiment_summary.csv', index=False)
+    print("\nExperiment Summary:")
+    print(summary)
+    return summary
 
-main(f"results/underparametrized1/run_{1}")
+
+def get_statisitcs(save_path="results/", configs=["underparametrized"], model_names=["Baseline", "Strong Baseline", "Plasticity Multi Growth", "Plasticity Single Growth"], metrics = ["Parameters", "Best Val Acc", "Best Val Brier", "Test Acc", "Test Brier"], num_runs=5): 
+    num_runs = 5
+    datasets={}
+    for config in configs:
+        for i in range(1,num_runs+1): 
+            datasets[(config,i)] = pd.read_csv(f"{save_path}/{config}/run_{i}/experiment_summary.csv")
+
+    results={}
+    # mean and standard deviation
+    for config in configs:
+        result = []
+        for model_name in model_names:
+            row = {}
+            row["Model"] = model_name
+            for metric in metrics:
+                metric_values = []
+                for i in range(1, num_runs+1):
+                    metric_values.append(datasets[(config, i)].loc[datasets[(config, i)]["Model"] == model_name, metric].iloc[0])
+                row[f"{metric} (Mean)"] = np.mean(metric_values)
+                row[f"{metric} (Std)"] = np.std(metric_values)
+            result.append(row)
+        results[config] = pd.DataFrame(result)
+    return results
+
+
+df1=get_statisitcs(configs=["overparametrized"], model_names=["Baseline"])
+print(df1["overparametrized"])
+# for i in range(1,6):
+#     print("Running experiment for run", i)
+#     main(f"results/overparametrized/run_{i}")
+# print("All experiments completed.")
