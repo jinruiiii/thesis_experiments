@@ -166,22 +166,31 @@ def count_params(model):
 
 def penalised_loss_function(outputs, labels, kl_loss, beta, lambda_penalty, param_count):
     """Minimised objective: NLL + beta*KL + lambda*|theta| (negative penalised ELBO)."""
-    nll, _, kl_scaled = loss_function(outputs, labels, kl_loss, beta)
+    _, nll, kl_scaled = loss_function(outputs, labels, kl_loss, beta)
     penalty = lambda_penalty * param_count
     total = nll + kl_scaled + penalty
     return total, nll, kl_scaled, penalty
 
 
-def penalised_elbo_on_batch(model, inputs, labels, beta, lambda_penalty, dataset_size):
+def penalised_elbo_on_batch(model, inputs, labels, beta_scaled, lambda_penalty):
     """Penalised ELBO L_pen on a single batch (higher is better)."""
     model.eval()
     param_count = count_params(model)
     with torch.no_grad():
         outputs = model(inputs)
         loss, nll, kl_scaled, penalty = penalised_loss_function(
-            outputs, labels, model.kl_loss(), beta, lambda_penalty, param_count
+            outputs, labels, model.kl_loss(), beta_scaled, lambda_penalty, param_count
         )
     return -(loss.item())
+
+def penalised_elbo_on_batches(model, batches_val, beta_scaled, lambda_penalty):
+    """
+    Mean penalised ELBO over several validation batches (higher is better).
+    """
+    vals = []
+    for inputs, labels in batches_val:
+        vals.append(penalised_elbo_on_batch(model, inputs, labels, beta_scaled, lambda_penalty))
+    return float(np.mean(vals))
 
 
 def sample_batch(loader, device):
@@ -198,8 +207,18 @@ def sample_batch(loader, device):
     inputs, labels = next(iter(shuffled_loader))
     return inputs.to(device), labels.to(device)
 
+def sample_batches(loader, device, num_batches):
+    """
+    Draw num_batches random mini-batches from loader.dataset (like sample_batch, but repeated).
+    Returns list[(inputs, labels)].
+    """
+    batches = []
+    for _ in range(num_batches):
+        batches.append(sample_batch(loader, device))
+    return batches
 
-def train(model, train_dataloader, optimizer, epoch, device, beta, lambda_penalty=0):
+
+def train(model, train_dataloader, optimizer, epoch, device, beta_scaled, lambda_penalty=0):
     model.train()
     running_loss_total = 0.0
     running_loss_nll = 0.0
@@ -209,7 +228,6 @@ def train(model, train_dataloader, optimizer, epoch, device, beta, lambda_penalt
     correct = 0
     total = 0
     param_count = count_params(model)
-    beta_scaled = (1 / len(train_dataloader.dataset)) * beta
 
     progress_bar = tqdm(train_dataloader, desc=f'Epoch {epoch}')
 
@@ -264,7 +282,7 @@ def train(model, train_dataloader, optimizer, epoch, device, beta, lambda_penalt
     return train_loss_total, train_acc, train_loss_nll, train_loss_kl, train_brier, train_loss_penalty
 
 
-def validate(model, val_dataloader, device, beta, lambda_penalty=0):
+def validate(model, val_dataloader, device, beta_scaled, lambda_penalty=0):
     model.eval()
     val_loss_total = 0.0
     val_loss_nll = 0.0
@@ -274,7 +292,6 @@ def validate(model, val_dataloader, device, beta, lambda_penalty=0):
     correct = 0
     total = 0
     param_count = count_params(model)
-    beta_scaled = (1 / len(val_dataloader.dataset)) * beta
 
     with torch.no_grad():
         for inputs, labels in tqdm(val_dataloader, desc='Validating'):
@@ -320,23 +337,26 @@ def validate(model, val_dataloader, device, beta, lambda_penalty=0):
 
 
 def neurogenesis(plasticity_original, hidden_sizes, exclude=None, gamma=0.1):
-    """Growth candidate: expand layer l* with highest mean posterior variance U^(l)."""
+    """Growth candidate: expand layer l* with highest mean normalized posterior variance."""
     if exclude is None:
         exclude = []
     uncertainty = plasticity_original.get_average_uncertainty_per_layer()
-    print("\n Average Uncertainty per Hidden Layer:")
+    print("\n Average Normalised Uncertainty per Hidden Layer:")
     for i, val in enumerate(uncertainty):
         print(f"  Layer {i+1}: {val.item()/(hidden_sizes[i]**0.5):.6f}")
+    eligible = [i for i in range(len(uncertainty)) if i not in exclude]
+    if not eligible:
+        print("[neurogenesis] All layers excluded; ignoring exclude list for this step.")
+        eligible = list(range(len(uncertainty)))
     layer_to_expand = max(
-        (i for i in range(len(uncertainty)) if i not in exclude),
-        key=lambda i: uncertainty[i]/(hidden_sizes[i]**0.5)
+        eligible,
+        key=lambda i: uncertainty[i] / (hidden_sizes[i] ** 0.5),
     )
     neurons_to_add = max(1, math.ceil(gamma * hidden_sizes[layer_to_expand]))
     old_width = hidden_sizes[layer_to_expand]
     print(f"Expanding Layer {layer_to_expand+1} "
             f"(Highest Normalised Uncertainty: {uncertainty[layer_to_expand].item()/(hidden_sizes[layer_to_expand]**0.5):.6f}) "
             f"by {neurons_to_add} neurons")
-    )
 
     expanded_hidden_sizes = hidden_sizes.copy()
     expanded_hidden_sizes[layer_to_expand] += neurons_to_add
@@ -344,7 +364,7 @@ def neurogenesis(plasticity_original, hidden_sizes, exclude=None, gamma=0.1):
     plasticity_neurogenesis = BayesianFNN(
         plasticity_original.in_features, expanded_hidden_sizes, plasticity_original.out_features
     ).to(model_device)
-    return plasticity_neurogenesis, expanded_hidden_sizes
+    return plasticity_neurogenesis, expanded_hidden_sizes, layer_to_expand, old_width
 
 def expand_and_load_encoder_layer(old_sd, new_layer):
     new_sd = new_layer.state_dict()
@@ -369,16 +389,44 @@ def expand_and_load_encoder_layer(old_sd, new_layer):
 
     new_layer.load_state_dict(new_sd, strict=True)
 
+def _weight_snr(mu, rho, eps=1e-8):
+    """Element-wise |mu / sigma| for weight tensors."""
+    sigma = F.softplus(rho)
+
+    return torch.abs(mu) / (sigma + eps)
 def _neuron_snr_incoming(layer, eps=1e-8):
-    """SNR_j^(l) = mean_i |mu_ij / sigma_ij| over incoming weights only."""
-    sigma = F.softplus(layer.rho_w)
-    snr = torch.abs(layer.mu_w) / (sigma + eps)
+    """Mean incoming SNR per output neuron (row j of mu_w)."""
+    snr = _weight_snr(layer.mu_w, layer.rho_w, eps)
     return snr.mean(dim=1)
 
+def _neuron_snr_outgoing(next_layer, neuron_idx, eps=1e-8):
+    """Mean outgoing SNR for hidden neuron j via column j of the next layer."""
+    snr = _weight_snr(next_layer.mu_w, next_layer.rho_w, eps)
+    return snr[:, neuron_idx].mean()
 
-def neuroapoptosis(plasticity_model, prune_rate, exclude=None):
+def _neuron_snr_bidirectional(model, layer_idx, neuron_idx, eps=1e-8, combine="geometric"):
     """
-    Prune the bottom rho fraction of neurons globally by SNR.
+    Combined SNR for neuron j in hidden layer layer_idx.
+    combine: 'geometric' (sqrt(in*out)), 'min', or 'mean'
+    """
+    layer = model.layers[layer_idx]
+    snr_in = _neuron_snr_incoming(layer, eps)[neuron_idx]
+    if layer_idx + 1 < len(model.layers):
+        snr_out = _neuron_snr_outgoing(model.layers[layer_idx + 1], neuron_idx, eps)
+    else:
+        snr_out = _neuron_snr_outgoing(model.out, neuron_idx, eps)
+    if combine == "min":
+        return torch.min(snr_in, snr_out)
+    if combine == "mean":
+        return 0.5 * (snr_in + snr_out)
+    # geometric mean (default): penalises neurons weak on either path
+    return torch.sqrt(snr_in * snr_out + eps)
+
+
+def neuroapoptosis(plasticity_model, prune_rate, exclude=None, snr_combine="geometric"):
+    """
+    Prune the bottom rho fraction of neurons globally by bidirectional SNR.
+    Score_j^(l) combines incoming (row j) and outgoing (column j of next layer / out).
     Returns keep_dict or None if pruning would empty any layer.
     """
     if exclude is None:
@@ -387,93 +435,96 @@ def neuroapoptosis(plasticity_model, prune_rate, exclude=None):
     for i, layer in enumerate(plasticity_model.layers):
         if i in exclude:
             continue
-        snr_per_neuron = _neuron_snr_incoming(layer)
-        for j in range(snr_per_neuron.shape[0]):
-            neuron_entries.append((i, j, snr_per_neuron[j].item()))
-
+        n_neurons = layer.mu_w.shape[0]
+        for j in range(n_neurons):
+            score = _neuron_snr_bidirectional(
+                plasticity_model, i, j, combine=snr_combine
+            )
+            neuron_entries.append((i, j, score.item()))
     if not neuron_entries:
         return None
-
     total_neurons = len(neuron_entries)
     num_prune = max(1, int(prune_rate * total_neurons))
     neuron_entries.sort(key=lambda x: x[2])
-    to_prune = set((layer_idx, neuron_idx) for layer_idx, neuron_idx, _ in neuron_entries[:num_prune])
-
+    to_prune = {(layer_idx, neuron_idx) for layer_idx, neuron_idx, _ in neuron_entries[:num_prune]}
     keep_dict = {}
-    print("\n Neurons Pruned from Each Hidden Layer:")
+    print(f"\n Neurons pruned (bidirectional SNR, combine={snr_combine}):")
     for i, layer in enumerate(plasticity_model.layers):
         n_neurons = layer.mu_w.shape[0]
         if i in exclude:
             keep_dict[i] = list(range(n_neurons))
         else:
             keep_dict[i] = [j for j in range(n_neurons) if (i, j) not in to_prune]
-        print(f"Hidden Layer {i+1}: {n_neurons - len(keep_dict[i])}")
-
+        print(f"  Hidden layer {i + 1}: {n_neurons - len(keep_dict[i])} removed")
     if any(len(keep_dict[i]) == 0 for i in keep_dict):
         print("Pruning would empty a layer; skipping prune candidate.")
         return None
+    # Optional: log lowest scores for debugging
+    lowest = neuron_entries[: min(5, num_prune)]
+    print("  Lowest scores (layer, neuron, score):")
+    for layer_idx, neuron_idx, score in lowest:
+        print(f"    ({layer_idx}, {neuron_idx}): {score:.6f}")
     return keep_dict
 
 
-def _mask_warm_start_grads(model, layer_idx, old_width):
-    """Zero gradients on phi_old; only new-neuron parameters may update."""
-    for i, layer in enumerate(model.layers):
-        if i == layer_idx:
-            if layer.mu_w.grad is not None:
-                layer.mu_w.grad[:old_width].zero_()
-                layer.rho_w.grad[:old_width].zero_()
-                layer.mu_b.grad[:old_width].zero_()
-                layer.rho_b.grad[:old_width].zero_()
-        elif i == layer_idx + 1:
-            if layer.mu_w.grad is not None:
-                layer.mu_w.grad[:, :old_width].zero_()
-                layer.rho_w.grad[:, :old_width].zero_()
-        else:
-            for p in layer.parameters():
-                if p.grad is not None:
-                    p.grad.zero_()
+# def _mask_warm_start_grads(model, layer_idx, old_width):
+#     """Zero gradients on phi_old; only new-neuron parameters may update."""
+#     for i, layer in enumerate(model.layers):
+#         if i == layer_idx:
+#             if layer.mu_w.grad is not None:
+#                 layer.mu_w.grad[:old_width].zero_()
+#                 layer.rho_w.grad[:old_width].zero_()
+#                 layer.mu_b.grad[:old_width].zero_()
+#                 layer.rho_b.grad[:old_width].zero_()
+#         elif i == layer_idx + 1:
+#             if layer.mu_w.grad is not None:
+#                 layer.mu_w.grad[:, :old_width].zero_()
+#                 layer.rho_w.grad[:, :old_width].zero_()
+#         else:
+#             for p in layer.parameters():
+#                 if p.grad is not None:
+#                     p.grad.zero_()
 
-    for i, ln in enumerate(model.ln_layers):
-        if i == layer_idx:
-            if ln.weight.grad is not None:
-                ln.weight.grad[:old_width].zero_()
-                ln.bias.grad[:old_width].zero_()
-        else:
-            for p in ln.parameters():
-                if p.grad is not None:
-                    p.grad.zero_()
+#     for i, ln in enumerate(model.ln_layers):
+#         if i == layer_idx:
+#             if ln.weight.grad is not None:
+#                 ln.weight.grad[:old_width].zero_()
+#                 ln.bias.grad[:old_width].zero_()
+#         else:
+#             for p in ln.parameters():
+#                 if p.grad is not None:
+#                     p.grad.zero_()
 
-    if layer_idx + 1 < len(model.layers):
-        for p in model.out.parameters():
-            if p.grad is not None:
-                p.grad.zero_()
-    else:
-        if model.out.mu_w.grad is not None:
-            model.out.mu_w.grad[:, :old_width].zero_()
-            model.out.rho_w.grad[:, :old_width].zero_()
-        if model.out.mu_b.grad is not None:
-            model.out.mu_b.grad.zero_()
-        if model.out.rho_b.grad is not None:
-            model.out.rho_b.grad.zero_()
+#     if layer_idx + 1 < len(model.layers):
+#         for p in model.out.parameters():
+#             if p.grad is not None:
+#                 p.grad.zero_()
+#     else:
+#         if model.out.mu_w.grad is not None:
+#             model.out.mu_w.grad[:, :old_width].zero_()
+#             model.out.rho_w.grad[:, :old_width].zero_()
+#         if model.out.mu_b.grad is not None:
+#             model.out.mu_b.grad.zero_()
+#         if model.out.rho_b.grad is not None:
+#             model.out.rho_b.grad.zero_()
 
 
-def warm_start_new_neurons(model, layer_idx, old_width, batch_ws, K, eta_ws, beta, lambda_penalty, dataset_size):
-    """K gradient steps on phi_new only using warm-start batch B_ws."""
-    inputs, labels = batch_ws
-    beta_scaled = (1 / dataset_size) * beta
-
+def warm_start_model_on_batches(model, batches_ws, K, eta_ws, beta_scaled, lambda_penalty):
+    """
+    K gradient steps cycling through a list of warm-start batches.
+    Trains all params (as in your current warm_start_model), but on multiple batches.
+    """
     optimizer = optim.Adam(model.parameters(), lr=eta_ws)
     model.train()
-    param_count = count_params(model)
-
-    for _ in range(K):
+    for step in range(K):
+        inputs, labels = batches_ws[step % len(batches_ws)]
+        param_count = count_params(model) 
         optimizer.zero_grad()
         outputs = model(inputs)
         loss, _, _, _ = penalised_loss_function(
             outputs, labels, model.kl_loss(), beta_scaled, lambda_penalty, param_count
         )
         loss.backward()
-        _mask_warm_start_grads(model, layer_idx, old_width)
         optimizer.step()
 
 
@@ -498,34 +549,45 @@ def structural_decision_juncture(
     rho,
     K,
     eta_ws,
+    grow_exclude_layers=None
 ):
     """
     Evaluate growth and prune candidates via delta penalised ELBO on B_val.
     Returns (action, model, hidden_sizes, info_dict).
     """
     train_dataset_size = len(train_loader.dataset)
-    val_dataset_size = len(val_loader.dataset)
+    beta_scaled = (1 / train_dataset_size) * beta
 
-    batch_ws = sample_batch(train_loader, device)
-    batch_val = sample_batch(val_loader, device)
-    val_inputs, val_labels = batch_val
+    # choose how many batches
+    M_ws = 10     # warm-start batches
+    M_val = 20    # evaluation batches
 
-    L_before = penalised_elbo_on_batch(model, val_inputs, val_labels, beta, lambda_penalty, val_dataset_size)
+    batches_ws = sample_batches(train_loader, device, M_ws)
+    batches_val = sample_batches(val_loader, device, M_val)
+
+    L_before = penalised_elbo_on_batches(model, batches_val, beta_scaled, lambda_penalty)
     info = {
         'L_before': L_before,
         'delta_grow': None,
         'delta_prune': None,
         'param_count_before': count_params(model),
     }
+    if grow_exclude_layers is None:
+        grow_exclude_layers = []
 
     # Growth candidate
-    grow_model, hidden_sizes_g = neurogenesis(model, hidden_sizes, gamma=gamma)
-    expand_and_load_encoder_layer(model.state_dict(), grow_model)
-    warm_start_new_neurons(
-        grow_model, layer_idx, old_width, batch_ws, K, eta_ws, beta, lambda_penalty, train_dataset_size
+    grow_model, hidden_sizes_g, layer_idx, old_width = neurogenesis(
+        model,
+        hidden_sizes,
+        exclude=list(grow_exclude_layers),
+        gamma=gamma,
     )
-    L_after_grow = penalised_elbo_on_batch(
-        grow_model, val_inputs, val_labels, beta, lambda_penalty, val_dataset_size
+    expand_and_load_encoder_layer(model.state_dict(), grow_model)
+    warm_start_model_on_batches(
+        grow_model, batches_ws, K, eta_ws, beta_scaled, lambda_penalty
+    )
+    L_after_grow = penalised_elbo_on_batches(
+        grow_model, batches_val, beta_scaled, lambda_penalty
     )
     delta_grow = L_after_grow - L_before
     info['delta_grow'] = delta_grow
@@ -534,11 +596,19 @@ def structural_decision_juncture(
     delta_prune = float('-inf')
     prune_model = None
     hidden_sizes_p = None
-    keep_dict = neuroapoptosis(model, rho)
+    keep_dict = neuroapoptosis(model, rho, snr_combine="geometric")
     if keep_dict is not None:
         prune_model, hidden_sizes_p = build_pruned_model(model, keep_dict)
-        L_after_prune = penalised_elbo_on_batch(
-            prune_model, val_inputs, val_labels, beta, lambda_penalty, val_dataset_size
+        warm_start_model_on_batches(
+            prune_model,
+            batches_ws,
+            K,
+            eta_ws,
+            beta_scaled,
+            lambda_penalty,
+        )
+        L_after_prune = penalised_elbo_on_batches(
+            prune_model, batches_val, beta_scaled, lambda_penalty
         )
         delta_prune = L_after_prune - L_before
     info['delta_prune'] = delta_prune if keep_dict is not None else None
@@ -558,6 +628,8 @@ def structural_decision_juncture(
             best_model = prune_model
             best_hidden_sizes = hidden_sizes_p
 
+    info['grow_layer_idx'] = layer_idx
+    info['grow_exclude_layers'] = list(grow_exclude_layers)
     info['action'] = best_action
     info['param_count_after'] = count_params(best_model) if best_action != 'none' else info['param_count_before']
     print(
@@ -652,6 +724,7 @@ def run_experiment(experiment_name, model, train_loader, val_loader, test_loader
     loss_label = 'Penalised ELBO' if lambda_penalty > 0 else 'ELBO'
     best_nll = float("inf")
     best_model_state = None
+    beta_scaled = (1 / len(train_loader.dataset)) * beta
     
     # Training loop
     last_epoch = best_epoch = start_epoch - 1
@@ -660,7 +733,7 @@ def run_experiment(experiment_name, model, train_loader, val_loader, test_loader
         
         # Train
         train_loss_total, train_acc, train_loss_nll, train_loss_kl, train_brier, train_loss_penalty = train(
-            model, train_loader, optimizer, epoch, device, beta, lambda_penalty
+            model, train_loader, optimizer, epoch, device, beta_scaled, lambda_penalty
         )
         metrics['train_loss_total'].append(train_loss_total)
         metrics['train_loss_nll'].append(train_loss_nll)
@@ -671,7 +744,7 @@ def run_experiment(experiment_name, model, train_loader, val_loader, test_loader
 
         # Validate
         val_loss_total, val_acc, val_loss_nll, val_loss_kl, val_brier, val_loss_penalty = validate(
-            model, val_loader, device, beta, lambda_penalty
+            model, val_loader, device, beta_scaled, lambda_penalty
         )
         metrics['val_loss_total'].append(val_loss_total)
         metrics['val_loss_nll'].append(val_loss_nll)
@@ -722,7 +795,7 @@ def run_experiment(experiment_name, model, train_loader, val_loader, test_loader
         eval_model = best_model_for_eval if best_model_for_eval is not None else model
         
         test_loss_total, test_acc, test_loss_nll, test_loss_kl, test_brier, _ = validate(
-            eval_model, test_loader, device, beta, lambda_penalty
+            eval_model, test_loader, device, beta_scaled, lambda_penalty
         )
         print(f'Test Acc={test_acc:.2f}%, Test Loss={test_loss_total:.4f}, Test Brier={test_brier:.3f}')
         
@@ -799,9 +872,10 @@ def run_adaptive_experiment(
     warm_start_steps,
     warm_start_lr,
     output_dir=None,
+    growth_cooldown_junctures=1
 ):
     """
-    Dynamic structural adaptation via penalised ELBO (Algorithm 1).
+    Dynamic structural adaptation via penalised ELBO.
     Structural decisions every decision_interval epochs.
     """
     if output_dir is None:
@@ -835,16 +909,21 @@ def run_adaptive_experiment(
         'structural_delta_grow': [],
         'structural_delta_prune': [],
         'structural_L_before': [],
+        'structural_hidden_sizes': [],
         'param_count_history': [],
     }
+
+    growth_cooldown = {}
 
     best_nll = float('inf')
     best_model_state = None
     best_epoch = 0
+    best_hidden_sizes = list(hidden_sizes)
+    beta_scaled = (1 / len(train_loader.dataset)) * beta
 
     for epoch in range(1, num_epochs + 1):
         train_loss_total, train_acc, train_loss_nll, train_loss_kl, train_brier, train_loss_penalty = train(
-            model, train_loader, optimizer, epoch, device, beta, lambda_penalty
+            model, train_loader, optimizer, epoch, device, beta_scaled, lambda_penalty
         )
         metrics['train_loss_total'].append(train_loss_total)
         metrics['train_loss_nll'].append(train_loss_nll)
@@ -854,7 +933,7 @@ def run_adaptive_experiment(
         metrics['train_brier'].append(train_brier)
 
         val_loss_total, val_acc, val_loss_nll, val_loss_kl, val_brier, val_loss_penalty = validate(
-            model, val_loader, device, beta, lambda_penalty
+            model, val_loader, device, beta_scaled, lambda_penalty
         )
         metrics['val_loss_total'].append(val_loss_total)
         metrics['val_loss_nll'].append(val_loss_nll)
@@ -873,11 +952,22 @@ def run_adaptive_experiment(
         if val_loss_nll < best_nll:
             best_nll = val_loss_nll
             best_epoch = epoch
+            best_hidden_sizes = list(hidden_sizes)
             best_model_state = copy.deepcopy(model.state_dict())
-            torch.save(best_model_state, os.path.join(output_dir, 'best_model.pth'))
+            torch.save(
+                {
+                    'state_dict': best_model_state,
+                    'hidden_sizes': best_hidden_sizes,
+                    'epoch': best_epoch,
+                },
+                os.path.join(output_dir, 'best_model.pth'),
+            )
 
-        if epoch % decision_interval == 0:
+        if epoch % decision_interval == 0 and epoch != num_epochs:
             print("-" * 20 + f" Decision juncture (epoch {epoch}) " + "-" * 20)
+            exclude_layers = [i for i, rem in growth_cooldown.items() if rem > 0]
+            if exclude_layers:
+                print(f"Growth cooldown: excluding layer indices {exclude_layers} (0-based)")
             action, model, hidden_sizes, info = structural_decision_juncture(
                 model,
                 hidden_sizes,
@@ -890,18 +980,30 @@ def run_adaptive_experiment(
                 rho,
                 warm_start_steps,
                 warm_start_lr,
+                grow_exclude_layers=exclude_layers,
             )
             metrics['structural_epochs'].append(epoch)
             metrics['structural_actions'].append(action)
             metrics['structural_delta_grow'].append(info.get('delta_grow'))
             metrics['structural_delta_prune'].append(info.get('delta_prune'))
             metrics['structural_L_before'].append(info.get('L_before'))
+            metrics['structural_hidden_sizes'].append(list(hidden_sizes))
 
             if action != 'none':
                 optimizer = optim.Adam(
                     filter(lambda p: p.requires_grad, model.parameters()), lr=learning_rate
                 )
-                torch.save(model.state_dict(), os.path.join(output_dir, f'model_epoch{epoch}_{action}.pth'))
+        
+
+            if action == "grow" and growth_cooldown_junctures > 0:
+                grown = info["grow_layer_idx"]
+                growth_cooldown[grown] = growth_cooldown_junctures
+
+                for i in list(growth_cooldown.keys()):
+                    if i != grown: 
+                        growth_cooldown[i] -= 1
+                        if growth_cooldown[i] <= 0:
+                            del growth_cooldown[i]
 
     # Final test evaluation with best checkpoint
     plot_metrics(
@@ -910,14 +1012,21 @@ def run_adaptive_experiment(
     )
 
     if best_model_state is not None:
-        eval_model = copy.deepcopy(model)
-        eval_model.load_state_dict(best_model_state)
-        print(f"Loaded best model from Epoch {best_epoch} based on validation NLL for final testing.")
+        eval_model = BayesianFNN(
+            model.in_features,
+            best_hidden_sizes,
+            model.out_features,
+        ).to(device)
+        eval_model.load_state_dict(best_model_state, strict=True)
+        print(
+            f"Loaded best model from epoch {best_epoch} "
+            f"(hidden_sizes={best_hidden_sizes}) for final testing."
+        )
     else:
         eval_model = model
 
     test_loss_total, test_acc, test_loss_nll, test_loss_kl, test_brier, _ = validate(
-        eval_model, test_loader, device, beta, lambda_penalty
+        eval_model, test_loader, device, beta_scaled, lambda_penalty
     )
     print(f'Test Acc={test_acc:.2f}%, Test Loss={test_loss_total:.4f}, Test Brier={test_brier:.3f}')
 
@@ -960,6 +1069,7 @@ def run_adaptive_experiment(
         'delta_grow': metrics['structural_delta_grow'],
         'delta_prune': metrics['structural_delta_prune'],
         'L_before': metrics['structural_L_before'],
+        'hidden_sizes': [str(hs) for hs in metrics['structural_hidden_sizes']],
     })
     structural_df.to_csv(os.path.join(output_dir, 'structural_decisions.csv'), index=False)
 
@@ -977,14 +1087,13 @@ def main(save_path):
     num_epochs = 200
     batch_size = 1024
     learning_rate = 0.001
-    hidden_sizes = [512, 256, 128, 64]
-    # hidden_sizes = [16, 16, 16, 16]
+    hidden_sizes = [16, 16, 16, 16]
 
     beta = 0.1
-    lambda_penalty = 1e-4
+    lambda_penalty = 1e-6
     decision_interval = 10
     gamma = 0.1
-    rho = 0.05
+    rho = 0.1
     warm_start_steps = 5
     warm_start_lr = 0.001
     
@@ -1050,25 +1159,25 @@ def main(save_path):
     )
     
     # ========== Experiment 1: Baseline Model ==========
-    print("\n\n" + "="*50)
-    print("Training Baseline Model")
-    print("="*50)
+    # print("\n\n" + "="*50)
+    # print("Training Baseline Model")
+    # print("="*50)
     baseline_model = BayesianFNN(784, hidden_sizes, 10).to(device)
     initial_state_dict = copy.deepcopy(baseline_model.state_dict())
-    baseline_output_dir = os.path.join(save_path, 'baseline')
-    baseline_metrics, _, _= run_experiment(
-        'baseline', 
-        baseline_model, 
-        train_loader, 
-        val_loader, 
-        test_loader, 
-        num_epochs, 
-        learning_rate,
-        start_epoch=1,
-        run_test=True,
-        beta=beta,
-        output_dir=baseline_output_dir,
-    )
+    # baseline_output_dir = os.path.join(save_path, 'baseline')
+    # baseline_metrics, _, _= run_experiment(
+    #     'baseline', 
+    #     baseline_model, 
+    #     train_loader, 
+    #     val_loader, 
+    #     test_loader, 
+    #     num_epochs, 
+    #     learning_rate,
+    #     start_epoch=1,
+    #     run_test=True,
+    #     beta=beta,
+    #     output_dir=baseline_output_dir,
+    # )
 
 
     # ========== Experiment 2: Adaptive Model (Penalised ELBO) ==========
@@ -1100,41 +1209,41 @@ def main(save_path):
     )
     
     # # ========== Compare Results ==========
-    all_metrics = {
-         'baseline': baseline_metrics,
-        'plasticity': plasticity_metrics,
+    # all_metrics = {
+    #      'baseline': baseline_metrics,
+    #     'plasticity': plasticity_metrics,
 
-    }
-    plot_metrics(all_metrics, save_path=f'./{save_path}/model_comparison.png')
+    # }
+    # plot_metrics(all_metrics, save_path=f'./{save_path}/model_comparison.png')
     
     # Create summary table
-    summary = pd.DataFrame([
-        {
-            'Model': 'Baseline',
-            'Parameters': baseline_metrics['param_count'],
-            'Trainable Params': baseline_metrics['trainable_param_count'],
-            'Best Val Acc': max(baseline_metrics['val_acc']),
-            'Best Val Brier': min(baseline_metrics['val_brier']),
-            'Test Acc': baseline_metrics['test_acc'],
-            'Test Brier': baseline_metrics['test_brier'],
-            'Hidden Sizes': baseline_metrics['hidden_sizes'],
-        },
-        {
-            'Model': 'Plasticity',
-            'Parameters': plasticity_metrics['param_count'],
-            'Trainable Params': plasticity_metrics['trainable_param_count'],
-            'Best Val Acc': max(plasticity_metrics['val_acc']),
-            'Best Val Brier': min(plasticity_metrics['val_brier']),
-            'Test Acc': plasticity_metrics['test_acc'],
-            'Test Brier': plasticity_metrics['test_brier'],
-            'Hidden Sizes': plasticity_metrics['hidden_sizes'],
-        }
-    ])
+    # summary = pd.DataFrame([
+        # {
+        #     'Model': 'Baseline',
+        #     'Parameters': baseline_metrics['param_count'],
+        #     'Trainable Params': baseline_metrics['trainable_param_count'],
+        #     'Best Val Acc': max(baseline_metrics['val_acc']),
+        #     'Best Val Brier': min(baseline_metrics['val_brier']),
+        #     'Test Acc': baseline_metrics['test_acc'],
+        #     'Test Brier': baseline_metrics['test_brier'],
+        #     'Hidden Sizes': baseline_metrics['hidden_sizes'],
+        # },
+    #     {
+    #         'Model': 'Plasticity',
+    #         'Parameters': plasticity_metrics['param_count'],
+    #         'Trainable Params': plasticity_metrics['trainable_param_count'],
+    #         'Best Val Acc': max(plasticity_metrics['val_acc']),
+    #         'Best Val Brier': min(plasticity_metrics['val_brier']),
+    #         'Test Acc': plasticity_metrics['test_acc'],
+    #         'Test Brier': plasticity_metrics['test_brier'],
+    #         'Hidden Sizes': plasticity_metrics['hidden_sizes'],
+    #     }
+    # ])
     
-    summary.to_csv(f'./{save_path}/experiment_summary.csv', index=False)
-    print("\nExperiment Summary:")
-    print(summary)
-    return summary
+    # summary.to_csv(f'./{save_path}/experiment_summary.csv', index=False)
+    # print("\nExperiment Summary:")
+    # print(summary)
+    # return summary
 
 
 def get_statistics(save_path="results/", configs=["underparametrized"], model_names=["Baseline", "Plasticity"], metrics = ["Parameters", "Best Val Acc", "Best Val Brier", "Test Acc", "Test Brier"], num_runs=5): 
@@ -1165,5 +1274,5 @@ if __name__ == "__main__":
     # print(df1["overparametrized"])
     for i in range(1,6):
         print("Running experiment for run", i)
-        main(f"results/overparametrized/run_{i}")
+        main(f"results/underparametrized/run_{i}")
     print("All experiments completed.")
