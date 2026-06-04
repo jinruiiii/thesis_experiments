@@ -29,6 +29,80 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {device}")
 print(f"Random seed set to: {SEED} for full reproducibility")
 
+def ensure_output_dir(output_dir):
+    os.makedirs(output_dir, exist_ok=True)
+    return output_dir
+
+def save_checkpoint(
+    path,
+    state_dict,
+    epoch,
+    hidden_sizes=None,
+    selection_metric=None,
+    selection_value=None,
+):
+    payload = {
+        "state_dict": state_dict,
+        "epoch": int(epoch),
+    }
+    if hidden_sizes is not None:
+        payload["hidden_sizes"] = list(hidden_sizes)
+    if selection_metric is not None:
+        payload["selection_metric"] = str(selection_metric)
+    if selection_value is not None:
+        payload["selection_value"] = float(selection_value)
+    torch.save(payload, path)
+
+def write_metrics_csv(output_dir, metrics):
+    metrics_df = pd.DataFrame({
+        'epoch': range(1, 1 + len(metrics['train_loss_total'])),
+        'train_loss_total': metrics['train_loss_total'],
+        'train_loss_nll': metrics['train_loss_nll'],
+        'train_loss_kl': metrics['train_loss_kl'],
+        'train_loss_penalty': metrics['train_loss_penalty'],
+        'train_acc': metrics['train_acc'],
+        'train_brier': metrics['train_brier'],
+        'val_loss_total': metrics['val_loss_total'],
+        'val_loss_nll': metrics['val_loss_nll'],
+        'val_loss_kl': metrics['val_loss_kl'],
+        'val_loss_penalty': metrics['val_loss_penalty'],
+        'val_acc': metrics['val_acc'],
+        'val_brier': metrics['val_brier'],
+        'param_count': metrics['param_count_history'],
+    })
+    metrics_df.to_csv(os.path.join(output_dir, 'metrics.csv'), index=False)
+
+def write_experiment_summary_csv(
+    output_dir,
+    model_label,
+    params,
+    trainable_params,
+    hidden_sizes,
+    best_epoch,
+    best_val_total,
+    best_val_acc,
+    best_val_brier,
+    test_acc,
+    test_brier,
+    lambda_penalty,
+    selected_checkpoint_metric= "val_total",
+):
+    summary_df = pd.DataFrame([{
+        "Model": model_label,
+        "Parameters": int(params),
+        "Trainable Params": int(trainable_params),
+        "Best Val Acc": float(best_val_acc),
+        "Best Val Brier": float(best_val_brier),
+        "Test Acc": float(test_acc),
+        "Test Brier": float(test_brier),
+        "Hidden Sizes": str(list(hidden_sizes)),
+        "Lambda Penalty": float(lambda_penalty),
+        "Selected checkpoint metric": str(selected_checkpoint_metric),
+        "Selected epoch": int(best_epoch),
+        "Selected val_total": float(best_val_total),
+    }])
+    summary_df.to_csv(os.path.join(output_dir, "experiment_summary.csv"), index=False)
+
 def seed_worker(worker_id):
     """Function to ensure DataLoader workers use different seeds derived from the base seed"""
     worker_seed = SEED + worker_id
@@ -207,14 +281,37 @@ def sample_batch(loader, device):
     inputs, labels = next(iter(shuffled_loader))
     return inputs.to(device), labels.to(device)
 
+# def sample_batches(loader, device, num_batches):
+#     """
+#     Draw num_batches random mini-batches from loader.dataset (like sample_batch, but repeated).
+#     Returns list[(inputs, labels)].
+#     """
+#     batches = []
+#     for _ in range(num_batches):
+#         batches.append(sample_batch(loader, device))
+#     return batches
+
 def sample_batches(loader, device, num_batches):
     """
-    Draw num_batches random mini-batches from loader.dataset (like sample_batch, but repeated).
-    Returns list[(inputs, labels)].
+    Draw num_batches consecutive mini-batches from a single shuffled pass
+    (no replacement within this chunk).
     """
+    g = torch.Generator()
+    g.manual_seed(SEED + random.randint(0, 1_000_000))
+    shuffled_loader = DataLoader(
+        loader.dataset,
+        batch_size=loader.batch_size,
+        shuffle=True,
+        drop_last=False,
+        generator=g,
+        num_workers=loader.num_workers,
+        worker_init_fn=getattr(loader, "worker_init_fn", None),
+    )
     batches = []
+    it = iter(shuffled_loader)
     for _ in range(num_batches):
-        batches.append(sample_batch(loader, device))
+        inputs, labels = next(it)
+        batches.append((inputs.to(device), labels.to(device)))
     return batches
 
 
@@ -423,49 +520,70 @@ def _neuron_snr_bidirectional(model, layer_idx, neuron_idx, eps=1e-8, combine="g
     return torch.sqrt(snr_in * snr_out + eps)
 
 
-def neuroapoptosis(plasticity_model, prune_rate, exclude=None, snr_combine="geometric"):
+def neuroapoptosis(
+    plasticity_model,
+    prune_rate,
+    exclude=None,
+    snr_combine="geometric",
+    min_neurons_per_layer=2,
+):
     """
-    Prune the bottom rho fraction of neurons globally by bidirectional SNR.
-    Score_j^(l) combines incoming (row j) and outgoing (column j of next layer / out).
-    Returns keep_dict or None if pruning would empty any layer.
+    Per-layer structured pruning: prune bottom prune_rate fraction *within each layer*
+    by bidirectional SNR.
+
+    Returns keep_dict[layer_idx] = list of kept neuron indices for each hidden layer,
+    or None if pruning would violate min_neurons_per_layer in any layer.
     """
     if exclude is None:
         exclude = []
-    neuron_entries = []
-    for i, layer in enumerate(plasticity_model.layers):
-        if i in exclude:
-            continue
-        n_neurons = layer.mu_w.shape[0]
-        for j in range(n_neurons):
-            score = _neuron_snr_bidirectional(
-                plasticity_model, i, j, combine=snr_combine
-            )
-            neuron_entries.append((i, j, score.item()))
-    if not neuron_entries:
-        return None
-    total_neurons = len(neuron_entries)
-    num_prune = max(1, int(prune_rate * total_neurons))
-    neuron_entries.sort(key=lambda x: x[2])
-    to_prune = {(layer_idx, neuron_idx) for layer_idx, neuron_idx, _ in neuron_entries[:num_prune]}
+
     keep_dict = {}
-    print(f"\n Neurons pruned (bidirectional SNR, combine={snr_combine}):")
+
     for i, layer in enumerate(plasticity_model.layers):
         n_neurons = layer.mu_w.shape[0]
+
+        # Always keep excluded layers unchanged
         if i in exclude:
             keep_dict[i] = list(range(n_neurons))
-        else:
-            keep_dict[i] = [j for j in range(n_neurons) if (i, j) not in to_prune]
-        print(f"  Hidden layer {i + 1}: {n_neurons - len(keep_dict[i])} removed")
-    if any(len(keep_dict[i]) == 0 for i in keep_dict):
-        print("Pruning would empty a layer; skipping prune candidate.")
-        return None
-    # Optional: log lowest scores for debugging
-    lowest = neuron_entries[: min(5, num_prune)]
-    print("  Lowest scores (layer, neuron, score):")
-    for layer_idx, neuron_idx, score in lowest:
-        print(f"    ({layer_idx}, {neuron_idx}): {score:.6f}")
-    return keep_dict
+            continue
 
+        # If already too small to prune safely, keep as-is
+        if n_neurons <= min_neurons_per_layer:
+            keep_dict[i] = list(range(n_neurons))
+            continue
+
+        # Compute bidirectional SNR score for each neuron j in this layer
+        scores = []
+        for j in range(n_neurons):
+            s = _neuron_snr_bidirectional(plasticity_model, i, j, combine=snr_combine)
+            scores.append(float(s.item()))
+
+        # Decide how many to prune in this layer
+        num_prune = int(prune_rate * n_neurons)
+        num_prune = max(1, num_prune)  # prune at least 1 if pruning is enabled
+        # Ensure we keep at least min_neurons_per_layer
+        max_prune_allowed = n_neurons - min_neurons_per_layer
+        if max_prune_allowed <= 0:
+            keep_dict[i] = list(range(n_neurons))
+            continue
+        num_prune = min(num_prune, max_prune_allowed)
+
+        # Pick lowest-scoring neurons to prune
+        neuron_indices = list(range(n_neurons))
+        neuron_indices.sort(key=lambda j: scores[j])
+        pruned = set(neuron_indices[:num_prune])
+
+        kept = [j for j in range(n_neurons) if j not in pruned]
+        if len(kept) < min_neurons_per_layer:
+            return None  # should not happen given logic, but keeps it safe
+
+        keep_dict[i] = kept
+
+    # Final safety check: don't allow any layer to become empty
+    if any(len(v) == 0 for v in keep_dict.values()):
+        return None
+
+    return keep_dict
 
 # def _mask_warm_start_grads(model, layer_idx, old_width):
 #     """Zero gradients on phi_old; only new-neuron parameters may update."""
@@ -508,8 +626,92 @@ def neuroapoptosis(plasticity_model, prune_rate, exclude=None, snr_combine="geom
 #         if model.out.rho_b.grad is not None:
 #             model.out.rho_b.grad.zero_()
 
+def _mask_warm_start_grads_grow_new_only(model, layer_idx, old_width):
+    """
+    Growth warm-start gradient mask (new-only).
 
-def warm_start_model_on_batches(model, batches_ws, K, eta_ws, beta_scaled, lambda_penalty):
+    Allows updates only to:
+    - grown layer's new neurons: rows [old_width:]
+    - its LayerNorm entries: indices [old_width:]
+    - immediate downstream weights connected to new neurons: columns [old_width:]
+
+    Everything else is frozen (gradients zeroed).
+    """
+    if layer_idx is None or old_width is None:
+        raise ValueError("layer_idx and old_width must be provided for grow_new_only masking")
+    if old_width <= 0:
+        return
+
+    def _zero_grad_full(p):
+        if p is not None and getattr(p, "grad", None) is not None:
+            p.grad.zero_()
+
+    def _zero_grad_rows(p, n_rows):
+        if p is not None and getattr(p, "grad", None) is not None:
+            p.grad[:n_rows].zero_()
+
+    def _zero_grad_cols(p, n_cols):
+        if p is not None and getattr(p, "grad", None) is not None:
+            p.grad[:, :n_cols].zero_()
+
+    num_hidden = len(model.layers)
+
+    # Hidden layers
+    for i, layer in enumerate(model.layers):
+        if i == layer_idx:
+            # Freeze old neurons in grown layer; allow new neuron rows [old_width:].
+            _zero_grad_rows(getattr(layer, "mu_w", None), old_width)
+            _zero_grad_rows(getattr(layer, "rho_w", None), old_width)
+            _zero_grad_rows(getattr(layer, "mu_b", None), old_width)
+            _zero_grad_rows(getattr(layer, "rho_b", None), old_width)
+        elif i == layer_idx + 1:
+            # Allow adapting fan-out from new neurons only (columns [old_width:]).
+            _zero_grad_cols(getattr(layer, "mu_w", None), old_width)
+            _zero_grad_cols(getattr(layer, "rho_w", None), old_width)
+            # Keep next-layer biases fixed (output-neuron biases) under new-only policy.
+            _zero_grad_full(getattr(layer, "mu_b", None))
+            _zero_grad_full(getattr(layer, "rho_b", None))
+        else:
+            # Completely freeze unrelated layers.
+            _zero_grad_full(getattr(layer, "mu_w", None))
+            _zero_grad_full(getattr(layer, "rho_w", None))
+            _zero_grad_full(getattr(layer, "mu_b", None))
+            _zero_grad_full(getattr(layer, "rho_b", None))
+
+    # LayerNorm layers
+    for i, ln in enumerate(getattr(model, "ln_layers", [])):
+        if i == layer_idx:
+            _zero_grad_rows(getattr(ln, "weight", None), old_width)
+            _zero_grad_rows(getattr(ln, "bias", None), old_width)
+        else:
+            _zero_grad_full(getattr(ln, "weight", None))
+            _zero_grad_full(getattr(ln, "bias", None))
+
+    # Output layer
+    if layer_idx == num_hidden - 1:
+        # Growing last hidden layer: allow adapting out weights connected to new neurons.
+        _zero_grad_cols(getattr(model.out, "mu_w", None), old_width)
+        _zero_grad_cols(getattr(model.out, "rho_w", None), old_width)
+        _zero_grad_full(getattr(model.out, "mu_b", None))
+        _zero_grad_full(getattr(model.out, "rho_b", None))
+    else:
+        _zero_grad_full(getattr(model.out, "mu_w", None))
+        _zero_grad_full(getattr(model.out, "rho_w", None))
+        _zero_grad_full(getattr(model.out, "mu_b", None))
+        _zero_grad_full(getattr(model.out, "rho_b", None))
+
+
+def warm_start_model_on_batches(
+    model,
+    batches_ws,
+    K,
+    eta_ws,
+    beta_scaled,
+    lambda_penalty,
+    mask_mode= None,
+    layer_idx= None,
+    old_width= None,
+):
     """
     K gradient steps cycling through a list of warm-start batches.
     Trains all params (as in your current warm_start_model), but on multiple batches.
@@ -525,6 +727,8 @@ def warm_start_model_on_batches(model, batches_ws, K, eta_ws, beta_scaled, lambd
             outputs, labels, model.kl_loss(), beta_scaled, lambda_penalty, param_count
         )
         loss.backward()
+        if mask_mode == "grow_new_only":
+            _mask_warm_start_grads_grow_new_only(model, layer_idx=layer_idx, old_width=old_width)
         optimizer.step()
 
 
@@ -559,8 +763,8 @@ def structural_decision_juncture(
     beta_scaled = (1 / train_dataset_size) * beta
 
     # choose how many batches
-    M_ws = 10     # warm-start batches
-    M_val = 20    # evaluation batches
+    M_ws = 40     # warm-start batches
+    M_val = 10    # evaluation batches
 
     batches_ws = sample_batches(train_loader, device, M_ws)
     batches_val = sample_batches(val_loader, device, M_val)
@@ -584,7 +788,15 @@ def structural_decision_juncture(
     )
     expand_and_load_encoder_layer(model.state_dict(), grow_model)
     warm_start_model_on_batches(
-        grow_model, batches_ws, K, eta_ws, beta_scaled, lambda_penalty
+        grow_model,
+        batches_ws,
+        K,
+        eta_ws,
+        beta_scaled,
+        lambda_penalty,
+        mask_mode="grow_new_only",
+        layer_idx=layer_idx,
+        old_width=old_width,
     )
     L_after_grow = penalised_elbo_on_batches(
         grow_model, batches_val, beta_scaled, lambda_penalty
@@ -685,12 +897,12 @@ def truncate_and_load_encoder_layer(old_sd, keep_dict, new_layer):
 
 
 def run_experiment(experiment_name, model, train_loader, val_loader, test_loader, num_epochs,
-                   learning_rate=0.001, start_epoch=1, metrics=None, run_test=False, beta=0.1,
+                   learning_rate=0.001, start_epoch=1, metrics=None, beta=0.1,
                    lambda_penalty=0, output_dir=None):
     """Run a complete training experiment and return metrics"""
     if output_dir is None:
         output_dir = os.path.join('./results', experiment_name)
-    os.makedirs(output_dir, exist_ok=True)
+    ensure_output_dir(output_dir)
 
     print(f"\n{'-'*20} Running {experiment_name} experiment {'-'*20}")
     
@@ -720,9 +932,10 @@ def run_experiment(experiment_name, model, train_loader, val_loader, test_loader
         metrics['val_brier'] = []
         metrics['train_loss_penalty'] = []
         metrics['val_loss_penalty'] = []
+        metrics['param_count_history'] = []
 
     loss_label = 'Penalised ELBO' if lambda_penalty > 0 else 'ELBO'
-    best_nll = float("inf")
+    best_total = float("inf")
     best_model_state = None
     beta_scaled = (1 / len(train_loader.dataset)) * beta
     
@@ -752,6 +965,7 @@ def run_experiment(experiment_name, model, train_loader, val_loader, test_loader
         metrics['val_acc'].append(val_acc)
         metrics['val_brier'].append(val_brier)
         metrics['val_loss_penalty'].append(val_loss_penalty)
+        metrics['param_count_history'].append(count_params(model))
 
         penalty_str = f', Penalty={train_loss_penalty:.4f}' if lambda_penalty > 0 else ''
         print(
@@ -761,11 +975,18 @@ def run_experiment(experiment_name, model, train_loader, val_loader, test_loader
             f'Val Loss(KL)={val_loss_kl:.4f}, Val Acc={val_acc:.2f}%, Val Brier={val_brier:.3f}'
         )
         
-        if val_loss_nll < best_nll:
-            best_nll = val_loss_nll
+        if val_loss_total < best_total:
+            best_total = val_loss_total
             best_epoch = epoch
             best_model_state = copy.deepcopy(model.state_dict())
-            torch.save(best_model_state, os.path.join(output_dir, 'best_model.pth'))
+            save_checkpoint(
+                os.path.join(output_dir, "best_checkpoint.pth"),
+                state_dict=best_model_state,
+                epoch=best_epoch,
+                hidden_sizes=[layer.mu_w.shape[0] for layer in model.layers],
+                selection_metric="val_total",
+                selection_value=best_total,
+            )
         
     # Plot and save metrics
     plot_metrics(
@@ -784,72 +1005,75 @@ def run_experiment(experiment_name, model, train_loader, val_loader, test_loader
         save_path=os.path.join(output_dir, 'metrics.png')
     )
 
-    if run_test:
-        # Load best model for test
-        best_model_for_eval = None
-        if best_model_state is not None:
-            best_model_for_eval = copy.deepcopy(model)
-            best_model_for_eval.load_state_dict(best_model_state)
-            print(f"Loaded best model from Epoch {best_epoch} based on validation loss for final testing.")
-    
-        eval_model = best_model_for_eval if best_model_for_eval is not None else model
-        
-        test_loss_total, test_acc, test_loss_nll, test_loss_kl, test_brier, _ = validate(
-            eval_model, test_loader, device, beta_scaled, lambda_penalty
-        )
-        print(f'Test Acc={test_acc:.2f}%, Test Loss={test_loss_total:.4f}, Test Brier={test_brier:.3f}')
-        
-        # Save best checkpoint (same weights used for test eval)
-        checkpoint = best_model_state if best_model_state is not None else model.state_dict()
-        torch.save(checkpoint, os.path.join(output_dir, 'model.pth'))
+    # Load best model for test
+    best_model_for_eval = None
+    if best_model_state is not None:
+        best_model_for_eval = copy.deepcopy(model)
+        best_model_for_eval.load_state_dict(best_model_state)
+        print(f"Loaded best model from Epoch {best_epoch} based on validation loss for final testing.")
 
-        # get final architecture
-        hidden_sizes = []
-        for i, layer in enumerate(eval_model.layers):
-            hidden_sizes.append(layer.mu_w.shape[0])
-        
-        # Update metrics
-        metrics.update({
-            'test_acc': test_acc,
-            'test_loss_total': test_loss_total,
-            'test_loss_nll': test_loss_nll,
-            'test_loss_kl': test_loss_kl,
-            'test_brier': test_brier,
-            'param_count': param_stats['total_params'],
-            'trainable_param_count': param_stats.get('trainable_params', param_stats['total_params']),
-            'hidden_sizes': hidden_sizes
-        })
-        
-        # Create a metrics DataFrame
-        metrics_df = pd.DataFrame({
-            'epoch': range(1, 1 + len(metrics['train_loss_total'])),
-            'train_loss_total': metrics['train_loss_total'],
-            'train_loss_nll': metrics['train_loss_nll'],
-            'train_loss_kl': metrics['train_loss_kl'],
-            'train_loss_penalty': metrics.get('train_loss_penalty', []),
-            'train_acc': metrics['train_acc'],
-            'train_brier': metrics['train_brier'],
-            'val_loss_total': metrics['val_loss_total'],
-            'val_loss_nll': metrics['val_loss_nll'],
-            'val_loss_kl': metrics['val_loss_kl'],
-            'val_loss_penalty': metrics.get('val_loss_penalty', []),
-            'val_acc': metrics['val_acc'],
-            'val_brier': metrics['val_brier'],
-        })
-        metrics_df.to_csv(os.path.join(output_dir, 'metrics.csv'), index=False)
-        
-        # Print summary
-        print(f"\n{experiment_name} Summary:")
-        print(f"Best validation accuracy: {max(metrics['val_acc'][start_epoch-1:]):.2f}%")
-        print(f"Best validation loss: {min(metrics['val_loss_total'][start_epoch-1:]):.4f}")
-        print(f"Best validation loss (NLL): {min(metrics['val_loss_nll'][start_epoch-1:]):.4f}")
-        print(f"Best validation loss (KL): {min(metrics['val_loss_kl'][start_epoch-1:]):.4f}")
-        print(f"Best validation brier: {min(metrics['val_brier'][start_epoch-1:]):.3f}")
-        print(f"Final test accuracy: {test_acc:.2f}%")
-        print(f"Final test loss: {test_loss_total:.4f}")
-        print(f"Final test loss (NLL): {test_loss_nll:.4f}")
-        print(f"Final test loss (KL): {test_loss_kl:.4f}")
-        print(f"Final test brier: {test_brier:.3f}")
+    eval_model = best_model_for_eval if best_model_for_eval is not None else model
+    
+    test_loss_total, test_acc, test_loss_nll, test_loss_kl, test_brier, _ = validate(
+        eval_model, test_loader, device, beta_scaled, lambda_penalty
+    )
+    print(f'Test Acc={test_acc:.2f}%, Test Loss={test_loss_total:.4f}, Test Brier={test_brier:.3f}')
+    
+    # Save best checkpoint (same weights used for test eval)
+    checkpoint = best_model_state if best_model_state is not None else model.state_dict()
+    save_checkpoint(
+        os.path.join(output_dir, "final_checkpoint.pth"),
+        state_dict=checkpoint,
+        epoch=best_epoch if best_model_state is not None else last_epoch,
+        hidden_sizes=[layer.mu_w.shape[0] for layer in eval_model.layers],
+    )
+
+    # get final architecture
+    hidden_sizes = []
+    for i, layer in enumerate(eval_model.layers):
+        hidden_sizes.append(layer.mu_w.shape[0])
+    
+    # Update metrics
+    metrics.update({
+        'test_acc': test_acc,
+        'test_loss_total': test_loss_total,
+        'test_loss_nll': test_loss_nll,
+        'test_loss_kl': test_loss_kl,
+        'test_brier': test_brier,
+        'param_count': count_params(eval_model),
+        'trainable_param_count': eval_model.get_param_stats()['trainable_params'],
+        'hidden_sizes': hidden_sizes
+    })
+    
+    write_metrics_csv(output_dir, metrics)
+    write_experiment_summary_csv(
+        output_dir,
+        model_label=experiment_name,
+        params=metrics["param_count"],
+        trainable_params=metrics["trainable_param_count"],
+        hidden_sizes=metrics["hidden_sizes"],
+        best_epoch=best_epoch,
+        best_val_total=best_total,
+        best_val_acc=max(metrics["val_acc"]),
+        best_val_brier=min(metrics["val_brier"]),
+        test_acc=metrics["test_acc"],
+        test_brier=metrics["test_brier"],
+        lambda_penalty=lambda_penalty,
+        selected_checkpoint_metric="val_total",
+    )
+    
+    # Print summary
+    print(f"\n{experiment_name} Summary:")
+    print(f"Best validation accuracy: {max(metrics['val_acc'][start_epoch-1:]):.2f}%")
+    print(f"Best validation loss: {min(metrics['val_loss_total'][start_epoch-1:]):.4f}")
+    print(f"Best validation loss (NLL): {min(metrics['val_loss_nll'][start_epoch-1:]):.4f}")
+    print(f"Best validation loss (KL): {min(metrics['val_loss_kl'][start_epoch-1:]):.4f}")
+    print(f"Best validation brier: {min(metrics['val_brier'][start_epoch-1:]):.3f}")
+    print(f"Final test accuracy: {test_acc:.2f}%")
+    print(f"Final test loss: {test_loss_total:.4f}")
+    print(f"Final test loss (NLL): {test_loss_nll:.4f}")
+    print(f"Final test loss (KL): {test_loss_kl:.4f}")
+    print(f"Final test brier: {test_brier:.3f}")
     
     epochs_run = last_epoch - start_epoch + 1
     return metrics, model, epochs_run
@@ -866,21 +1090,24 @@ def run_adaptive_experiment(
     learning_rate,
     beta,
     lambda_penalty,
-    decision_interval,
     gamma,
     rho,
     warm_start_steps,
     warm_start_lr,
+    decision_interval=None,
+    decision_interval_min=2,
+    decision_interval_max=20,
+    decision_interval_power=2.0,
     output_dir=None,
     growth_cooldown_junctures=1
 ):
     """
     Dynamic structural adaptation via penalised ELBO.
-    Structural decisions every decision_interval epochs.
+    Structural decisions happen at annealed intervals (or fixed if decision_interval is set).
     """
     if output_dir is None:
         output_dir = os.path.join('./results', experiment_name)
-    os.makedirs(output_dir, exist_ok=True)
+    ensure_output_dir(output_dir)
 
     print("\n" + "=" * 50)
     print(f"Training {experiment_name.upper()} (Penalised ELBO, lambda={lambda_penalty})")
@@ -915,11 +1142,25 @@ def run_adaptive_experiment(
 
     growth_cooldown = {}
 
-    best_nll = float('inf')
+    best_total = float('inf')
     best_model_state = None
     best_epoch = 0
     best_hidden_sizes = list(hidden_sizes)
     beta_scaled = (1 / len(train_loader.dataset)) * beta
+
+    def _annealed_decision_interval(epoch: int) -> int:
+        # Option B: I(e)=floor(Imin + (Imax-Imin)*(e/E)^p), clamped.
+        E = max(1, num_epochs)
+        frac = min(1.0, max(0.0, epoch / E))
+        raw = decision_interval_min + (decision_interval_max - decision_interval_min) * (frac ** decision_interval_power)
+        interval = int(math.floor(raw))
+        return interval
+
+    next_decision_epoch = None
+    if decision_interval is not None:
+        next_decision_epoch = decision_interval
+    else:
+        next_decision_epoch = decision_interval_min
 
     for epoch in range(1, num_epochs + 1):
         train_loss_total, train_acc, train_loss_nll, train_loss_kl, train_brier, train_loss_penalty = train(
@@ -949,21 +1190,21 @@ def run_adaptive_experiment(
             f'Train Acc={train_acc:.2f}%, Val Loss(Penalised ELBO)={val_loss_total:.4f}, Val Acc={val_acc:.2f}%'
         )
 
-        if val_loss_nll < best_nll:
-            best_nll = val_loss_nll
+        if val_loss_total < best_total:
+            best_total = val_loss_total
             best_epoch = epoch
             best_hidden_sizes = list(hidden_sizes)
             best_model_state = copy.deepcopy(model.state_dict())
-            torch.save(
-                {
-                    'state_dict': best_model_state,
-                    'hidden_sizes': best_hidden_sizes,
-                    'epoch': best_epoch,
-                },
-                os.path.join(output_dir, 'best_model.pth'),
+            save_checkpoint(
+                os.path.join(output_dir, "best_checkpoint.pth"),
+                state_dict=best_model_state,
+                epoch=best_epoch,
+                hidden_sizes=best_hidden_sizes,
+                selection_metric="val_total",
+                selection_value=best_total,
             )
 
-        if epoch % decision_interval == 0 and epoch != num_epochs:
+        if epoch == next_decision_epoch and epoch != num_epochs:
             print("-" * 20 + f" Decision juncture (epoch {epoch}) " + "-" * 20)
             exclude_layers = [i for i, rem in growth_cooldown.items() if rem > 0]
             if exclude_layers:
@@ -1005,6 +1246,12 @@ def run_adaptive_experiment(
                         if growth_cooldown[i] <= 0:
                             del growth_cooldown[i]
 
+            # Schedule next decision juncture.
+            if decision_interval is not None:
+                next_decision_epoch = min(num_epochs, epoch + int(decision_interval))
+            else:
+                next_decision_epoch = min(num_epochs, epoch + _annealed_decision_interval(epoch))
+
     # Final test evaluation with best checkpoint
     plot_metrics(
         {experiment_name: metrics},
@@ -1031,7 +1278,12 @@ def run_adaptive_experiment(
     print(f'Test Acc={test_acc:.2f}%, Test Loss={test_loss_total:.4f}, Test Brier={test_brier:.3f}')
 
     checkpoint = best_model_state if best_model_state is not None else model.state_dict()
-    torch.save(checkpoint, os.path.join(output_dir, 'model.pth'))
+    save_checkpoint(
+        os.path.join(output_dir, "final_checkpoint.pth"),
+        state_dict=checkpoint,
+        epoch=best_epoch if best_model_state is not None else num_epochs,
+        hidden_sizes=[layer.mu_w.shape[0] for layer in eval_model.layers],
+    )
 
     final_hidden_sizes = [layer.mu_w.shape[0] for layer in eval_model.layers]
     metrics.update({
@@ -1045,23 +1297,23 @@ def run_adaptive_experiment(
         'hidden_sizes': final_hidden_sizes,
     })
 
-    metrics_df = pd.DataFrame({
-        'epoch': range(1, 1 + len(metrics['train_loss_total'])),
-        'train_loss_total': metrics['train_loss_total'],
-        'train_loss_nll': metrics['train_loss_nll'],
-        'train_loss_kl': metrics['train_loss_kl'],
-        'train_loss_penalty': metrics['train_loss_penalty'],
-        'train_acc': metrics['train_acc'],
-        'train_brier': metrics['train_brier'],
-        'val_loss_total': metrics['val_loss_total'],
-        'val_loss_nll': metrics['val_loss_nll'],
-        'val_loss_kl': metrics['val_loss_kl'],
-        'val_loss_penalty': metrics['val_loss_penalty'],
-        'val_acc': metrics['val_acc'],
-        'val_brier': metrics['val_brier'],
-        'param_count': metrics['param_count_history'],
-    })
-    metrics_df.to_csv(os.path.join(output_dir, 'metrics.csv'), index=False)
+    write_metrics_csv(output_dir, metrics)
+    write_experiment_summary_csv(
+        output_dir,
+        model_label=experiment_name,
+        params=metrics["param_count"],
+        trainable_params=metrics["trainable_param_count"],
+        hidden_sizes=metrics["hidden_sizes"],
+        best_epoch=best_epoch,
+        best_val_total=best_total,
+        best_val_acc=max(metrics["val_acc"]),
+        best_val_brier=min(metrics["val_brier"]),
+        test_acc=metrics["test_acc"],
+        test_brier=metrics["test_brier"],
+        lambda_penalty=lambda_penalty,
+        selected_checkpoint_metric="val_total",
+    )
+
 
     structural_df = pd.DataFrame({
         'epoch': metrics['structural_epochs'],
@@ -1075,7 +1327,7 @@ def run_adaptive_experiment(
 
     print(f"\n{experiment_name} Summary:")
     print(f"Best validation accuracy: {max(metrics['val_acc']):.2f}%")
-    print(f"Best validation NLL: {min(metrics['val_loss_nll']):.4f}")
+    print(f"Best validation total: {min(metrics['val_loss_total']):.4f}")
     print(f"Final test accuracy: {test_acc:.2f}%")
     print(f"Final hidden sizes: {final_hidden_sizes}")
     print(f"Structural decisions: {metrics['structural_actions']}")
@@ -1087,14 +1339,16 @@ def main(save_path):
     num_epochs = 200
     batch_size = 1024
     learning_rate = 0.001
-    hidden_sizes = [16, 16, 16, 16]
+    hidden_sizes = [256, 256, 256, 256]
 
-    beta = 0.1
-    lambda_penalty = 1e-6
-    decision_interval = 10
-    gamma = 0.1
-    rho = 0.1
-    warm_start_steps = 5
+    beta = 0.01
+    lambda_penalty = 1e-8
+    decision_interval_min = 2
+    decision_interval_max = 20
+    decision_interval_power = 2
+    gamma = 0.2
+    rho = 0.05
+    warm_start_steps = 80
     warm_start_lr = 0.001
     
     # Create results directory
@@ -1174,7 +1428,6 @@ def main(save_path):
     #     num_epochs, 
     #     learning_rate,
     #     start_epoch=1,
-    #     run_test=True,
     #     beta=beta,
     #     output_dir=baseline_output_dir,
     # )
@@ -1188,7 +1441,7 @@ def main(save_path):
 
     base_model = BayesianFNN(784, hidden_sizes, 10).to(device)
     base_model.load_state_dict(initial_state_dict)
-    plasticity_output_dir = os.path.join(save_path, 'plasticity')
+    plasticity_output_dir = os.path.join(save_path, f'plasticity_{hidden_sizes[0]}_{lambda_penalty}')
     plasticity_metrics, _, _ = run_adaptive_experiment(
         "plasticity",
         base_model,
@@ -1200,11 +1453,14 @@ def main(save_path):
         learning_rate,
         beta,
         lambda_penalty=lambda_penalty,
-        decision_interval=decision_interval,
         gamma=gamma,
         rho=rho,
         warm_start_steps=warm_start_steps,
         warm_start_lr=warm_start_lr,
+        decision_interval=None,
+        decision_interval_min=decision_interval_min,
+        decision_interval_max=decision_interval_max,
+        decision_interval_power=decision_interval_power,
         output_dir=plasticity_output_dir,
     )
     
@@ -1246,33 +1502,123 @@ def main(save_path):
     # return summary
 
 
-def get_statistics(save_path="results/", configs=["underparametrized"], model_names=["Baseline", "Plasticity"], metrics = ["Parameters", "Best Val Acc", "Best Val Brier", "Test Acc", "Test Brier"], num_runs=5): 
-    datasets={}
-    for config in configs:
-        for i in range(1,num_runs+1): 
-            datasets[(config,i)] = pd.read_csv(f"{save_path}/{config}/run_{i}/experiment_summary.csv")
+def get_statistics(
+    save_path="results",
+    experiments=["plasticity"],
+    num_runs=None,
+):
+    """
+    Aggregate per-run experiment summaries into mean/std across runs.
 
-    results={}
-    # mean and standard deviation
-    for config in configs:
-        result = []
-        for model_name in model_names:
-            row = {}
-            row["Model"] = model_name
-            for metric in metrics:
-                metric_values = []
-                for i in range(1, num_runs+1):
-                    metric_values.append(datasets[(config, i)].loc[datasets[(config, i)]["Model"] == model_name, metric].iloc[0])
-                row[f"{metric} (Mean)"] = np.mean(metric_values)
-                row[f"{metric} (Std)"] = np.std(metric_values, ddof=1)
-            result.append(row)
-        results[config] = pd.DataFrame(result)
+    This function reads the per-run `experiment_summary.csv` files written by
+    `write_experiment_summary_csv(...)` and aggregates across runs.
+
+    Expected layout (as produced by `__main__` at the bottom of this file):
+      - {save_path}/run_{i}/{experiment}/experiment_summary.csv
+
+    Example:
+      - results/run_1/plasticity/experiment_summary.csv
+
+    If `num_runs` is provided, only `run_1..run_{num_runs}` are considered.
+    Otherwise all `run_*` directories found under `save_path` are used.
+
+    Note: `params_def` is kept for backwards compatibility but is ignored when
+    reading from `experiment_summary.csv` (which already stores a single
+    parameter count per run).
+    """
+    save_path = os.path.normpath(str(save_path))
+
+    # Discover run indices from folders named run_<int>
+    run_indices = []
+    if os.path.isdir(save_path):
+        for name in os.listdir(save_path):
+            if not name.startswith("run_"):
+                continue
+            suffix = name[len("run_") :]
+            if suffix.isdigit():
+                run_indices.append(int(suffix))
+    run_indices = sorted(set(run_indices))
+    if num_runs is not None:
+        run_indices = [i for i in run_indices if 1 <= i <= int(num_runs)]
+
+    if not run_indices:
+        raise FileNotFoundError(
+            f"No run folders found under '{save_path}'. Expected folders like '{save_path}/run_1/'."
+        )
+
+    results = {}
+    for experiment in experiments:
+        rows = []
+        for run_i in run_indices:
+            summary_path = os.path.join(
+                save_path, f"run_{run_i}", str(experiment), "experiment_summary.csv"
+            )
+            if not os.path.exists(summary_path):
+                raise FileNotFoundError(
+                    f"Missing experiment summary for run {run_i}: '{summary_path}'"
+                )
+            df = pd.read_csv(summary_path)
+            if df.empty:
+                raise ValueError(f"Empty experiment summary: {summary_path}")
+
+            row0 = df.iloc[0]
+            params = int(float(row0["Parameters"]))
+            best_val_acc = float(row0["Best Val Acc"])
+            best_val_brier = float(row0["Best Val Brier"])
+            test_acc = float(row0["Test Acc"])
+            test_brier = float(row0["Test Brier"])
+
+            rows.append(
+                {
+                    "run": run_i,
+                    "Experiment": str(experiment),
+                    "Parameters": params,
+                    "Best Val Acc": best_val_acc,
+                    "Best Val Brier": best_val_brier,
+                    "Test Acc": test_acc,
+                    "Test Brier": test_brier
+                }
+            )
+
+        per_run = pd.DataFrame(rows).sort_values("run").reset_index(drop=True)
+        summary = pd.DataFrame(
+            [
+                {
+                    "Metric": "Parameters",
+                    "Mean": float(per_run["Parameters"].mean()),
+                    "Std": float(per_run["Parameters"].std(ddof=1)),
+                },
+                {
+                    "Metric": "Best Val Acc",
+                    "Mean": float(per_run["Best Val Acc"].mean()),
+                    "Std": float(per_run["Best Val Acc"].std(ddof=1)),
+                },
+                {
+                    "Metric": "Best Val Brier",
+                    "Mean": float(per_run["Best Val Brier"].mean()),
+                    "Std": float(per_run["Best Val Brier"].std(ddof=1)),
+                },
+                                {
+                    "Metric": "Test Acc",
+                    "Mean": float(per_run["Test Acc"].mean()),
+                    "Std": float(per_run["Test Acc"].std(ddof=1)),
+                },
+                                {
+                    "Metric": "Test Brier",
+                    "Mean": float(per_run["Test Brier"].mean()),
+                    "Std": float(per_run["Test Brier"].std(ddof=1)),
+                },
+            ]
+        )
+
+        results[str(experiment)] = {"per_run": per_run, "summary": summary}
+
     return results
 
 if __name__ == "__main__":
-    # df1=get_statistics(configs=["overparametrized"], model_names=["Baseline"])
-    # print(df1["overparametrized"])
+    # df1=get_statistics(save_path="results", experiments=["plasticity_256_1e-08"], num_runs=5)
+    # print(df1["plasticity_256_1e-08"]["summary"])
     for i in range(1,6):
         print("Running experiment for run", i)
-        main(f"results/underparametrized/run_{i}")
+        main(f"results/run_{i}")
     print("All experiments completed.")
