@@ -13,6 +13,7 @@ import torch.nn as nn
 import copy
 import pandas as pd
 import matplotlib.pyplot as plt
+from pathlib import Path
 
 # Set all random seeds for reproducibility
 SEED = 42
@@ -585,47 +586,6 @@ def neuroapoptosis(
 
     return keep_dict
 
-# def _mask_warm_start_grads(model, layer_idx, old_width):
-#     """Zero gradients on phi_old; only new-neuron parameters may update."""
-#     for i, layer in enumerate(model.layers):
-#         if i == layer_idx:
-#             if layer.mu_w.grad is not None:
-#                 layer.mu_w.grad[:old_width].zero_()
-#                 layer.rho_w.grad[:old_width].zero_()
-#                 layer.mu_b.grad[:old_width].zero_()
-#                 layer.rho_b.grad[:old_width].zero_()
-#         elif i == layer_idx + 1:
-#             if layer.mu_w.grad is not None:
-#                 layer.mu_w.grad[:, :old_width].zero_()
-#                 layer.rho_w.grad[:, :old_width].zero_()
-#         else:
-#             for p in layer.parameters():
-#                 if p.grad is not None:
-#                     p.grad.zero_()
-
-#     for i, ln in enumerate(model.ln_layers):
-#         if i == layer_idx:
-#             if ln.weight.grad is not None:
-#                 ln.weight.grad[:old_width].zero_()
-#                 ln.bias.grad[:old_width].zero_()
-#         else:
-#             for p in ln.parameters():
-#                 if p.grad is not None:
-#                     p.grad.zero_()
-
-#     if layer_idx + 1 < len(model.layers):
-#         for p in model.out.parameters():
-#             if p.grad is not None:
-#                 p.grad.zero_()
-#     else:
-#         if model.out.mu_w.grad is not None:
-#             model.out.mu_w.grad[:, :old_width].zero_()
-#             model.out.rho_w.grad[:, :old_width].zero_()
-#         if model.out.mu_b.grad is not None:
-#             model.out.mu_b.grad.zero_()
-#         if model.out.rho_b.grad is not None:
-#             model.out.rho_b.grad.zero_()
-
 def _mask_warm_start_grads_grow_new_only(model, layer_idx, old_width):
     """
     Growth warm-start gradient mask (new-only).
@@ -731,6 +691,49 @@ def warm_start_model_on_batches(
             _mask_warm_start_grads_grow_new_only(model, layer_idx=layer_idx, old_width=old_width)
         optimizer.step()
 
+def truncate_and_load_encoder_layer(old_sd, keep_dict, new_layer):
+    num_layers = len(keep_dict)
+    new_sd = {}
+    for i in range(num_layers):
+        keep_i = keep_dict.get(i, None)
+        keep_prev = keep_dict.get(i - 1, None)
+        for p in ["mu_w", "rho_w", "mu_b", "rho_b"]:
+            key = f"layers.{i}.{p}"
+            if key not in old_sd:
+                raise ValueError(f"{key} is missing in the plasticity model")
+            w = old_sd[key]
+            if w.ndim == 2:
+                if keep_i is not None:
+                    w = w[keep_i, :]
+                if keep_prev is not None:
+                    w = w[:, keep_prev]
+            # bias (1D)
+            else:
+                if keep_i is not None:
+                    w = w[keep_i]
+            new_sd[key] = w
+
+        for p in ["weight", "bias"]:
+            key = f"ln_layers.{i}.{p}"
+            if key not in old_sd:
+                raise ValueError(f"{key} is missing in the plasticity model")
+            w = old_sd[key]
+            if keep_i is not None:
+                w = w[keep_i]
+            new_sd[key] = w
+
+    for p in ["mu_w", "rho_w", "mu_b", "rho_b"]:
+        key = f"out.{p}"
+        if key not in old_sd:
+            raise ValueError(f"{key} is missing in the plasticity model")
+        w = old_sd[key]
+        keep_last = keep_dict.get(num_layers - 1, None)
+        if w.ndim == 2 and keep_last is not None:
+            w = w[:, keep_last]
+        new_sd[key] = w
+
+
+    new_layer.load_state_dict(new_sd, strict=True)
 
 def build_pruned_model(model, keep_dict):
     """Construct pruned BayesianFNN from keep_dict."""
@@ -850,50 +853,6 @@ def structural_decision_juncture(
         f"action={best_action}"
     )
     return best_action, best_model, best_hidden_sizes, info
-
-def truncate_and_load_encoder_layer(old_sd, keep_dict, new_layer):
-    num_layers = len(keep_dict)
-    new_sd = {}
-    for i in range(num_layers):
-        keep_i = keep_dict.get(i, None)
-        keep_prev = keep_dict.get(i - 1, None)
-        for p in ["mu_w", "rho_w", "mu_b", "rho_b"]:
-            key = f"layers.{i}.{p}"
-            if key not in old_sd:
-                raise ValueError(f"{key} is missing in the plasticity model")
-            w = old_sd[key]
-            if w.ndim == 2:
-                if keep_i is not None:
-                    w = w[keep_i, :]
-                if keep_prev is not None:
-                    w = w[:, keep_prev]
-            # bias (1D)
-            else:
-                if keep_i is not None:
-                    w = w[keep_i]
-            new_sd[key] = w
-
-        for p in ["weight", "bias"]:
-            key = f"ln_layers.{i}.{p}"
-            if key not in old_sd:
-                raise ValueError(f"{key} is missing in the plasticity model")
-            w = old_sd[key]
-            if keep_i is not None:
-                w = w[keep_i]
-            new_sd[key] = w
-
-    for p in ["mu_w", "rho_w", "mu_b", "rho_b"]:
-        key = f"out.{p}"
-        if key not in old_sd:
-            raise ValueError(f"{key} is missing in the plasticity model")
-        w = old_sd[key]
-        keep_last = keep_dict.get(num_layers - 1, None)
-        if w.ndim == 2 and keep_last is not None:
-            w = w[:, keep_last]
-        new_sd[key] = w
-
-
-    new_layer.load_state_dict(new_sd, strict=True)
 
 
 def run_experiment(experiment_name, model, train_loader, val_loader, test_loader, num_epochs,
@@ -1339,10 +1298,10 @@ def main(save_path):
     num_epochs = 200
     batch_size = 1024
     learning_rate = 0.001
-    hidden_sizes = [256, 256, 256, 256]
+    hidden_sizes = [16, 16, 16, 16]
 
     beta = 0.01
-    lambda_penalty = 1e-8
+    lambda_penalty = 1e-6
     decision_interval_min = 2
     decision_interval_max = 20
     decision_interval_power = 2
@@ -1413,56 +1372,56 @@ def main(save_path):
     )
     
     # ========== Experiment 1: Baseline Model ==========
-    # print("\n\n" + "="*50)
-    # print("Training Baseline Model")
-    # print("="*50)
+    print("\n\n" + "="*50)
+    print("Training Baseline Model")
+    print("="*50)
     baseline_model = BayesianFNN(784, hidden_sizes, 10).to(device)
     initial_state_dict = copy.deepcopy(baseline_model.state_dict())
-    # baseline_output_dir = os.path.join(save_path, 'baseline')
-    # baseline_metrics, _, _= run_experiment(
-    #     'baseline', 
-    #     baseline_model, 
-    #     train_loader, 
-    #     val_loader, 
-    #     test_loader, 
-    #     num_epochs, 
-    #     learning_rate,
-    #     start_epoch=1,
-    #     beta=beta,
-    #     output_dir=baseline_output_dir,
-    # )
+    baseline_output_dir = os.path.join(save_path, f'baseline{hidden_sizes[0]}')
+    baseline_metrics, _, _= run_experiment(
+        'baseline', 
+        baseline_model, 
+        train_loader, 
+        val_loader, 
+        test_loader, 
+        num_epochs, 
+        learning_rate,
+        start_epoch=1,
+        beta=beta,
+        output_dir=baseline_output_dir,
+    )
 
 
     # ========== Experiment 2: Adaptive Model (Penalised ELBO) ==========
 
-    print("\n\n" + "=" * 50)
-    print("Training Adaptive Model")
-    print("=" * 50)
+    # print("\n\n" + "=" * 50)
+    # print("Training Adaptive Model")
+    # print("=" * 50)
 
-    base_model = BayesianFNN(784, hidden_sizes, 10).to(device)
-    base_model.load_state_dict(initial_state_dict)
-    plasticity_output_dir = os.path.join(save_path, f'plasticity_{hidden_sizes[0]}_{lambda_penalty}')
-    plasticity_metrics, _, _ = run_adaptive_experiment(
-        "plasticity",
-        base_model,
-        hidden_sizes,
-        train_loader,
-        val_loader,
-        test_loader,
-        num_epochs,
-        learning_rate,
-        beta,
-        lambda_penalty=lambda_penalty,
-        gamma=gamma,
-        rho=rho,
-        warm_start_steps=warm_start_steps,
-        warm_start_lr=warm_start_lr,
-        decision_interval=None,
-        decision_interval_min=decision_interval_min,
-        decision_interval_max=decision_interval_max,
-        decision_interval_power=decision_interval_power,
-        output_dir=plasticity_output_dir,
-    )
+    # base_model = BayesianFNN(784, hidden_sizes, 10).to(device)
+    # base_model.load_state_dict(initial_state_dict)
+    # plasticity_output_dir = os.path.join(save_path, f'plasticity_{hidden_sizes[0]}_{lambda_penalty}')
+    # plasticity_metrics, _, _ = run_adaptive_experiment(
+    #     "plasticity",
+    #     base_model,
+    #     hidden_sizes,
+    #     train_loader,
+    #     val_loader,
+    #     test_loader,
+    #     num_epochs,
+    #     learning_rate,
+    #     beta,
+    #     lambda_penalty=lambda_penalty,
+    #     gamma=gamma,
+    #     rho=rho,
+    #     warm_start_steps=warm_start_steps,
+    #     warm_start_lr=warm_start_lr,
+    #     decision_interval=None,
+    #     decision_interval_min=decision_interval_min,
+    #     decision_interval_max=decision_interval_max,
+    #     decision_interval_power=decision_interval_power,
+    #     output_dir=plasticity_output_dir,
+    # )
     
     # # ========== Compare Results ==========
     # all_metrics = {
@@ -1615,10 +1574,88 @@ def get_statistics(
 
     return results
 
+
+def plot_param_count(
+    save_path="results",
+    experiments=None,
+):
+    base = Path(save_path)
+    entries = []
+    for experiment in experiments:
+        parts = experiment.split("_")
+        init_width = int(parts[1])
+        for run_dir in sorted(base.glob("run_*")):
+            exp_dir = run_dir / experiment
+            metrics_path = exp_dir / "metrics.csv"
+            summary_path = exp_dir / "experiment_summary.csv"
+            summary = pd.read_csv(summary_path)
+            best_epoch = int(summary.iloc[0]["Selected epoch"])
+            entries.append(
+                (run_dir.name, init_width, experiment, metrics_path, best_epoch)
+            )
+
+    init_widths = sorted({w for _, w, _, _, _ in entries})
+    colors = plt.cm.tab10.colors
+    color_by_width = {w: colors[i % len(colors)] for i, w in enumerate(init_widths)}
+    run_ids = sorted({r for r, _, _, _, _ in entries})
+    fig, ax = plt.subplots(figsize=(12, 6))
+    for run_id, init_width, experiment, metrics_path, best_epoch in entries:
+        df = pd.read_csv(metrics_path)
+        ax.plot(
+            df["epoch"],
+            df["param_count"],
+            color=color_by_width[init_width],
+            linestyle="-",
+            alpha=0.85,
+            linewidth=1.5,
+        )
+        row = df.loc[df["epoch"] == best_epoch]
+        ax.scatter(
+            row["epoch"],
+            row["param_count"],
+            color=color_by_width[init_width],
+            s=50,
+            zorder=5,
+            edgecolors="black",
+            linewidths=0.5,
+        )
+    from matplotlib.lines import Line2D
+    color_handles = [
+        Line2D([0], [0], color=color_by_width[w], lw=2, label=f"init width {w}")
+        for w in init_widths
+    ]
+    leg1 = ax.legend(handles=color_handles, title="Initial architecture", loc="upper right")
+    ax.add_artist(leg1)
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Parameter count")
+    ax.set_title("Parameter count vs epoch")
+    ax.set_title("Parameter count vs epoch (dot = selected checkpoint)")
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    tag = "_".join(experiments[0].split("_")[1:3]) if len(experiments) == 1 else "multi"
+    out_name = f"param_count_{tag}.png"
+    fig.savefig(out_name, dpi=150)
+    plt.show()
+    return fig
+
 if __name__ == "__main__":
-    # df1=get_statistics(save_path="results", experiments=["plasticity_256_1e-08"], num_runs=5)
+    # df1=get_statistics(save_path="results", experiments=["plasticity_16_1e-08","plasticity_32_1e-08","plasticity_64_1e-08","plasticity_128_1e-08", "plasticity_256_1e-08"], num_runs=5)
+    # print(df1["plasticity_16_1e-08"]["summary"])
+    # print(df1["plasticity_32_1e-08"]["summary"])
+    # print(df1["plasticity_64_1e-08"]["summary"])
+    # print(df1["plasticity_128_1e-08"]["summary"])
     # print(df1["plasticity_256_1e-08"]["summary"])
     for i in range(1,6):
         print("Running experiment for run", i)
         main(f"results/run_{i}")
     print("All experiments completed.")
+#     plot_param_count(
+#     save_path="results",
+#     experiments=[
+#         "plasticity_16_1e-07",
+#         "plasticity_32_1e-07",
+#         "plasticity_64_1e-07",
+#         "plasticity_128_1e-07",
+#         "plasticity_256_1e-07",
+#     ],
+# )
