@@ -14,16 +14,21 @@ import copy
 import pandas as pd
 import matplotlib.pyplot as plt
 from pathlib import Path
+from matplotlib.lines import Line2D
+import re
 
-# Set all random seeds for reproducibility
 SEED = 42
-random.seed(SEED)
-np.random.seed(SEED)
-torch.manual_seed(SEED)
-torch.cuda.manual_seed_all(SEED)
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
-os.environ['PYTHONHASHSEED'] = str(SEED)
+
+def set_seed(seed=SEED):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    os.environ['PYTHONHASHSEED'] = str(seed)
+
+set_seed()  # initial seed at import
 
 # Set device
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -434,12 +439,20 @@ def validate(model, val_dataloader, device, beta_scaled, lambda_penalty=0):
     return val_loss_total, val_acc, val_loss_nll, val_loss_kl, val_brier, val_loss_penalty
 
 
-def neurogenesis(plasticity_original, hidden_sizes, exclude=None, gamma=0.1):
-    """Growth candidate: expand layer l* with highest mean normalized posterior variance."""
+def neurogenesis(
+    plasticity_original,
+    hidden_sizes,
+    exclude=None,
+    gamma=0.1,
+    uncertainty_combine="geometric",
+):
+    """Growth candidate: expand layer l* with highest mean bidirectional posterior variance."""
     if exclude is None:
         exclude = []
-    uncertainty = plasticity_original.get_average_uncertainty_per_layer()
-    print("\n Average Normalised Uncertainty per Hidden Layer:")
+    uncertainty = plasticity_original.get_average_bidirectional_uncertainty_per_layer(
+        combine=uncertainty_combine
+    )
+    print("\n Average Bidirectional Normalised Uncertainty per Hidden Layer:")
     for i, val in enumerate(uncertainty):
         print(f"  Layer {i+1}: {val.item()/(hidden_sizes[i]**0.5):.6f}")
     eligible = [i for i in range(len(uncertainty)) if i not in exclude]
@@ -453,7 +466,7 @@ def neurogenesis(plasticity_original, hidden_sizes, exclude=None, gamma=0.1):
     neurons_to_add = max(1, math.ceil(gamma * hidden_sizes[layer_to_expand]))
     old_width = hidden_sizes[layer_to_expand]
     print(f"Expanding Layer {layer_to_expand+1} "
-            f"(Highest Normalised Uncertainty: {uncertainty[layer_to_expand].item()/(hidden_sizes[layer_to_expand]**0.5):.6f}) "
+            f"(Highest Bidirectional Normalised Uncertainty: {uncertainty[layer_to_expand].item()/(hidden_sizes[layer_to_expand]**0.5):.6f}) "
             f"by {neurons_to_add} neurons")
 
     expanded_hidden_sizes = hidden_sizes.copy()
@@ -756,10 +769,13 @@ def structural_decision_juncture(
     rho,
     K,
     eta_ws,
-    grow_exclude_layers=None
+    grow_exclude_layers=None,
+    uncertainty_combine="geometric",
+    snr_combine="geometric",
 ):
     """
     Evaluate growth and prune candidates via delta penalised ELBO on B_val.
+    Deltas are relative to a warm-started baseline (same K steps as candidates).
     Returns (action, model, hidden_sizes, info_dict).
     """
     train_dataset_size = len(train_loader.dataset)
@@ -773,8 +789,23 @@ def structural_decision_juncture(
     batches_val = sample_batches(val_loader, device, M_val)
 
     L_before = penalised_elbo_on_batches(model, batches_val, beta_scaled, lambda_penalty)
+
+    none_model = copy.deepcopy(model)
+    warm_start_model_on_batches(
+        none_model,
+        batches_ws,
+        K,
+        eta_ws,
+        beta_scaled,
+        lambda_penalty,
+    )
+    L_after_none = penalised_elbo_on_batches(
+        none_model, batches_val, beta_scaled, lambda_penalty
+    )
+
     info = {
         'L_before': L_before,
+        'L_after_none': L_after_none,
         'delta_grow': None,
         'delta_prune': None,
         'param_count_before': count_params(model),
@@ -788,6 +819,7 @@ def structural_decision_juncture(
         hidden_sizes,
         exclude=list(grow_exclude_layers),
         gamma=gamma,
+        uncertainty_combine=uncertainty_combine,
     )
     expand_and_load_encoder_layer(model.state_dict(), grow_model)
     warm_start_model_on_batches(
@@ -797,21 +829,21 @@ def structural_decision_juncture(
         eta_ws,
         beta_scaled,
         lambda_penalty,
-        mask_mode="grow_new_only",
+        mask_mode=None,#"grow_new_only",
         layer_idx=layer_idx,
         old_width=old_width,
     )
     L_after_grow = penalised_elbo_on_batches(
         grow_model, batches_val, beta_scaled, lambda_penalty
     )
-    delta_grow = L_after_grow - L_before
+    delta_grow = L_after_grow - L_after_none
     info['delta_grow'] = delta_grow
 
     # Prune candidate
     delta_prune = float('-inf')
     prune_model = None
     hidden_sizes_p = None
-    keep_dict = neuroapoptosis(model, rho, snr_combine="geometric")
+    keep_dict = neuroapoptosis(model, rho, snr_combine=snr_combine)
     if keep_dict is not None:
         prune_model, hidden_sizes_p = build_pruned_model(model, keep_dict)
         warm_start_model_on_batches(
@@ -825,7 +857,7 @@ def structural_decision_juncture(
         L_after_prune = penalised_elbo_on_batches(
             prune_model, batches_val, beta_scaled, lambda_penalty
         )
-        delta_prune = L_after_prune - L_before
+        delta_prune = L_after_prune - L_after_none
     info['delta_prune'] = delta_prune if keep_dict is not None else None
 
     best_action = 'none'
@@ -848,7 +880,7 @@ def structural_decision_juncture(
     info['action'] = best_action
     info['param_count_after'] = count_params(best_model) if best_action != 'none' else info['param_count_before']
     print(
-        f"\nStructural decision: L_before={L_before:.4f}, "
+        f"\nStructural decision: L_before={L_before:.4f}, L_after_none={L_after_none:.4f}, "
         f"delta_grow={delta_grow:.4f}, delta_prune={info['delta_prune']}, "
         f"action={best_action}"
     )
@@ -1058,7 +1090,9 @@ def run_adaptive_experiment(
     decision_interval_max=20,
     decision_interval_power=2.0,
     output_dir=None,
-    growth_cooldown_junctures=1
+    growth_cooldown_junctures=1,
+    uncertainty_combine="geometric",
+    snr_combine="geometric",
 ):
     """
     Dynamic structural adaptation via penalised ELBO.
@@ -1095,6 +1129,7 @@ def run_adaptive_experiment(
         'structural_delta_grow': [],
         'structural_delta_prune': [],
         'structural_L_before': [],
+        'structural_L_after_none': [],
         'structural_hidden_sizes': [],
         'param_count_history': [],
     }
@@ -1181,12 +1216,15 @@ def run_adaptive_experiment(
                 warm_start_steps,
                 warm_start_lr,
                 grow_exclude_layers=exclude_layers,
+                uncertainty_combine=uncertainty_combine,
+                snr_combine=snr_combine,
             )
             metrics['structural_epochs'].append(epoch)
             metrics['structural_actions'].append(action)
             metrics['structural_delta_grow'].append(info.get('delta_grow'))
             metrics['structural_delta_prune'].append(info.get('delta_prune'))
             metrics['structural_L_before'].append(info.get('L_before'))
+            metrics['structural_L_after_none'].append(info.get('L_after_none'))
             metrics['structural_hidden_sizes'].append(list(hidden_sizes))
 
             if action != 'none':
@@ -1280,6 +1318,7 @@ def run_adaptive_experiment(
         'delta_grow': metrics['structural_delta_grow'],
         'delta_prune': metrics['structural_delta_prune'],
         'L_before': metrics['structural_L_before'],
+        'L_after_none': metrics['structural_L_after_none'],
         'hidden_sizes': [str(hs) for hs in metrics['structural_hidden_sizes']],
     })
     structural_df.to_csv(os.path.join(output_dir, 'structural_decisions.csv'), index=False)
@@ -1293,20 +1332,21 @@ def run_adaptive_experiment(
 
     return metrics, model, num_epochs
 
-def main(save_path):
+def main(save_path, hidden_sizes,lambda_penalty):
     # Hyperparameters
     num_epochs = 200
     batch_size = 1024
     learning_rate = 0.001
-    hidden_sizes = [16, 16, 16, 16]
+    #hidden_sizes = [64, 64, 64, 64]
 
     beta = 0.01
-    lambda_penalty = 1e-6
+    # lambda_penalty = 1e-6
     decision_interval_min = 2
     decision_interval_max = 20
     decision_interval_power = 2
     gamma = 0.2
-    rho = 0.05
+    # rho = 0.05
+    rho = 0.10
     warm_start_steps = 80
     warm_start_lr = 0.001
     
@@ -1372,56 +1412,57 @@ def main(save_path):
     )
     
     # ========== Experiment 1: Baseline Model ==========
-    print("\n\n" + "="*50)
-    print("Training Baseline Model")
-    print("="*50)
+    # print("\n\n" + "="*50)
+    # print("Training Baseline Model")
+    # print("="*50)
     baseline_model = BayesianFNN(784, hidden_sizes, 10).to(device)
     initial_state_dict = copy.deepcopy(baseline_model.state_dict())
-    baseline_output_dir = os.path.join(save_path, f'baseline{hidden_sizes[0]}')
-    baseline_metrics, _, _= run_experiment(
-        'baseline', 
-        baseline_model, 
-        train_loader, 
-        val_loader, 
-        test_loader, 
-        num_epochs, 
-        learning_rate,
-        start_epoch=1,
-        beta=beta,
-        output_dir=baseline_output_dir,
-    )
+    # baseline_output_dir = os.path.join(save_path, f'baseline_{hidden_sizes[0]}')
+    # baseline_metrics, _, _= run_experiment(
+    #     'baseline', 
+    #     baseline_model, 
+    #     train_loader, 
+    #     val_loader, 
+    #     test_loader, 
+    #     num_epochs, 
+    #     learning_rate,
+    #     start_epoch=1,
+    #     beta=beta,
+    #     output_dir=baseline_output_dir,
+    # )
 
 
     # ========== Experiment 2: Adaptive Model (Penalised ELBO) ==========
 
-    # print("\n\n" + "=" * 50)
-    # print("Training Adaptive Model")
-    # print("=" * 50)
+    print("\n\n" + "=" * 50)
+    print("Training Adaptive Model")
+    print("=" * 50)
 
-    # base_model = BayesianFNN(784, hidden_sizes, 10).to(device)
-    # base_model.load_state_dict(initial_state_dict)
-    # plasticity_output_dir = os.path.join(save_path, f'plasticity_{hidden_sizes[0]}_{lambda_penalty}')
-    # plasticity_metrics, _, _ = run_adaptive_experiment(
-    #     "plasticity",
-    #     base_model,
-    #     hidden_sizes,
-    #     train_loader,
-    #     val_loader,
-    #     test_loader,
-    #     num_epochs,
-    #     learning_rate,
-    #     beta,
-    #     lambda_penalty=lambda_penalty,
-    #     gamma=gamma,
-    #     rho=rho,
-    #     warm_start_steps=warm_start_steps,
-    #     warm_start_lr=warm_start_lr,
-    #     decision_interval=None,
-    #     decision_interval_min=decision_interval_min,
-    #     decision_interval_max=decision_interval_max,
-    #     decision_interval_power=decision_interval_power,
-    #     output_dir=plasticity_output_dir,
-    # )
+    base_model = BayesianFNN(784, hidden_sizes, 10).to(device)
+    base_model.load_state_dict(initial_state_dict)
+    plasticity_output_dir = os.path.join(save_path, f'plasticity_{hidden_sizes[0]}_{lambda_penalty}')
+    plasticity_metrics, _, _ = run_adaptive_experiment(
+        "plasticity",
+        base_model,
+        hidden_sizes,
+        train_loader,
+        val_loader,
+        test_loader,
+        num_epochs,
+        learning_rate,
+        beta,
+        lambda_penalty=lambda_penalty,
+        gamma=gamma,
+        rho=rho,
+        warm_start_steps=warm_start_steps,
+        warm_start_lr=warm_start_lr,
+        decision_interval=None,
+        decision_interval_min=decision_interval_min,
+        decision_interval_max=decision_interval_max,
+        decision_interval_power=decision_interval_power,
+        output_dir=plasticity_output_dir,
+        uncertainty_combine="mean"
+    )
     
     # # ========== Compare Results ==========
     # all_metrics = {
@@ -1578,65 +1619,513 @@ def get_statistics(
 def plot_param_count(
     save_path="results",
     experiments=None,
+    show_individual=False,
+    alpha_band=0.25,
+    show_checkpoint=True,
+    save_path_out=None,
+    show=True,
+    figsize=(12, 6),
+    dpi=150,
 ):
+    """
+    Plot parameter count vs epoch with mean line and std band per initial width,
+    aggregated across run_* folders.
+
+    Pass one lambda per call (e.g. all plasticity_*_1e-06); mixing lambdas with
+    the same init_width pools them under that width.
+
+    If show_individual is True, plot one line per run (no mean/std band) with a
+    checkpoint dot per run at its selected epoch. Otherwise plot mean line, std
+    band, and aggregated checkpoint markers per init_width.
+    """
     base = Path(save_path)
-    entries = []
+    rows = []
+    checkpoint_rows = []
+
     for experiment in experiments:
-        parts = experiment.split("_")
-        init_width = int(parts[1])
+        init_width = int(experiment.split("_")[1])
         for run_dir in sorted(base.glob("run_*")):
             exp_dir = run_dir / experiment
             metrics_path = exp_dir / "metrics.csv"
             summary_path = exp_dir / "experiment_summary.csv"
+            if not metrics_path.exists() or not summary_path.exists():
+                continue
+
+            run_id = int(run_dir.name.split("_", 1)[1])
             summary = pd.read_csv(summary_path)
             best_epoch = int(summary.iloc[0]["Selected epoch"])
-            entries.append(
-                (run_dir.name, init_width, experiment, metrics_path, best_epoch)
-            )
+            metrics_df = pd.read_csv(metrics_path)
 
-    init_widths = sorted({w for _, w, _, _, _ in entries})
+            for _, mrow in metrics_df.iterrows():
+                rows.append(
+                    {
+                        "run": run_id,
+                        "init_width": init_width,
+                        "experiment": experiment,
+                        "epoch": int(mrow["epoch"]),
+                        "param_count": float(mrow["param_count"]),
+                    }
+                )
+
+            best_rows = metrics_df.loc[metrics_df["epoch"] == best_epoch]
+            if not best_rows.empty:
+                checkpoint_rows.append(
+                    {
+                        "run": run_id,
+                        "init_width": init_width,
+                        "best_epoch": best_epoch,
+                        "best_param_count": float(best_rows.iloc[0]["param_count"]),
+                    }
+                )
+
+    if not rows:
+        raise FileNotFoundError(
+            f"No metrics.csv files found under {save_path} for experiments={experiments}"
+        )
+
+    df = pd.DataFrame(rows)
+    stats = (
+        df.groupby(["init_width", "epoch"], as_index=False)
+        .agg(
+            mean=("param_count", "mean"),
+            std=("param_count", "std"),
+            n_runs=("run", "nunique"),
+        )
+    )
+    stats["std"] = stats["std"].fillna(0.0)
+
+    init_widths = sorted(stats["init_width"].unique())
     colors = plt.cm.tab10.colors
     color_by_width = {w: colors[i % len(colors)] for i, w in enumerate(init_widths)}
-    run_ids = sorted({r for r, _, _, _, _ in entries})
-    fig, ax = plt.subplots(figsize=(12, 6))
-    for run_id, init_width, experiment, metrics_path, best_epoch in entries:
-        df = pd.read_csv(metrics_path)
-        ax.plot(
-            df["epoch"],
-            df["param_count"],
-            color=color_by_width[init_width],
-            linestyle="-",
-            alpha=0.85,
-            linewidth=1.5,
-        )
-        row = df.loc[df["epoch"] == best_epoch]
-        ax.scatter(
-            row["epoch"],
-            row["param_count"],
-            color=color_by_width[init_width],
-            s=50,
-            zorder=5,
-            edgecolors="black",
-            linewidths=0.5,
-        )
-    from matplotlib.lines import Line2D
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    if show_individual:
+        for (run_id, init_width), sub in df.groupby(["run", "init_width"]):
+            ax.plot(
+                sub["epoch"],
+                sub["param_count"],
+                color=color_by_width[init_width],
+                linestyle="-",
+                alpha=0.85,
+                linewidth=1.5,
+            )
+    else:
+        for init_width in init_widths:
+            sub = stats.loc[stats["init_width"] == init_width].sort_values("epoch")
+            color = color_by_width[init_width]
+            ax.plot(
+                sub["epoch"],
+                sub["mean"],
+                color=color,
+                linewidth=2.0,
+                alpha=0.95,
+            )
+            ax.fill_between(
+                sub["epoch"],
+                sub["mean"] - sub["std"],
+                sub["mean"] + sub["std"],
+                color=color,
+                alpha=alpha_band,
+            )
+
+    if show_checkpoint and checkpoint_rows:
+        ckpt_df = pd.DataFrame(checkpoint_rows)
+        if show_individual:
+            for _, row in ckpt_df.iterrows():
+                init_width = int(row["init_width"])
+                color = color_by_width[init_width]
+                ax.scatter(
+                    row["best_epoch"],
+                    row["best_param_count"],
+                    color=color,
+                    s=50,
+                    zorder=5,
+                    edgecolors="black",
+                    linewidths=0.5,
+                )
+        else:
+            ckpt_stats = (
+                ckpt_df.groupby("init_width", as_index=False)
+                .agg(
+                    best_epoch_mean=("best_epoch", "mean"),
+                    best_epoch_std=("best_epoch", "std"),
+                    best_param_mean=("best_param_count", "mean"),
+                    best_param_std=("best_param_count", "std"),
+                )
+            )
+            ckpt_stats["best_epoch_std"] = ckpt_stats["best_epoch_std"].fillna(0.0)
+            ckpt_stats["best_param_std"] = ckpt_stats["best_param_std"].fillna(0.0)
+
+            for _, row in ckpt_stats.iterrows():
+                init_width = int(row["init_width"])
+                color = color_by_width[init_width]
+                ax.errorbar(
+                    row["best_epoch_mean"],
+                    row["best_param_mean"],
+                    xerr=row["best_epoch_std"] if row["best_epoch_std"] > 0 else None,
+                    yerr=row["best_param_std"] if row["best_param_std"] > 0 else None,
+                    fmt="o",
+                    color=color,
+                    markersize=7,
+                    capsize=3,
+                    linestyle="none",
+                    zorder=5,
+                    markeredgecolor="black",
+                    markeredgewidth=0.5,
+                )
+
     color_handles = [
         Line2D([0], [0], color=color_by_width[w], lw=2, label=f"init width {w}")
         for w in init_widths
     ]
-    leg1 = ax.legend(handles=color_handles, title="Initial architecture", loc="upper right")
-    ax.add_artist(leg1)
+    ax.legend(handles=color_handles, title="Initial architecture", loc="upper right")
     ax.set_xlabel("Epoch")
     ax.set_ylabel("Parameter count")
-    ax.set_title("Parameter count vs epoch")
-    ax.set_title("Parameter count vs epoch (dot = selected checkpoint)")
+    title_suffix = "per run" if show_individual else "mean ± std"
+    checkpoint_note = "; dot = selected checkpoint" if show_checkpoint else ""
+    ax.set_title(f"Parameter count vs epoch ({title_suffix}{checkpoint_note})")
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
-    tag = "_".join(experiments[0].split("_")[1:3]) if len(experiments) == 1 else "multi"
-    out_name = f"param_count_{tag}.png"
-    fig.savefig(out_name, dpi=150)
-    plt.show()
-    return fig
+
+    if save_path_out is None:
+        tag = "_".join(experiments[0].split("_")[1:3]) if len(experiments) == 1 else "multi"
+        save_path_out = f"param_count_{tag}.png"
+    fig.savefig(save_path_out, dpi=dpi)
+
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+
+    return fig, ax, stats
+
+def _parse_experiment_dir_name(dirname):
+    """
+    Parse folder names like:
+      baseline_64
+      plasticity_128_1e-06
+    Returns dict with keys: kind, init_width, lambda_penalty (optional).
+    """
+    name = str(dirname)
+    m = re.match(r"^baseline_(\d+)$", name)
+    if m:
+        return {
+            "kind": "baseline",
+            "init_width": int(m.group(1)),
+            "lambda_penalty": None,
+            "label": f"baseline (init {m.group(1)})",
+        }
+    m = re.match(r"^plasticity_(\d+)_(.+)$", name)
+    if m:
+        width = int(m.group(1))
+        lam = float(m.group(2))
+        return {
+            "kind": "plasticity",
+            "init_width": width,
+            "lambda_penalty": lam,
+            "label": f"plasticity {width} λ={lam:g}",
+        }
+    return {
+        "kind": "other",
+        "init_width": None,
+        "lambda_penalty": None,
+        "label": name,
+    }
+def collect_experiment_summaries(
+    save_path="results",
+    experiments=None,
+    experiment_glob="*",
+    num_runs=None,
+    x_col="Parameters",
+    y_col="Test Acc",
+):
+    """
+    Load per-run rows from experiment_summary.csv.
+  Parameters
+    ----------
+    save_path : str
+        Root folder containing run_1, run_2, ...
+    experiments : list[str] or None
+        Explicit experiment folder names, e.g.
+        ["baseline_64", "plasticity_64_1e-06"].
+        If None, auto-discover under each run folder using experiment_glob.
+    experiment_glob : str
+        Glob for auto-discovery, e.g. "plasticity_*", "baseline_*", "*".
+    num_runs : int or None
+        If set, only use run_1 .. run_{num_runs}.
+    x_col, y_col : str
+        Columns from experiment_summary.csv.
+    Returns
+    -------
+    pd.DataFrame with one row per (run, experiment_folder).
+    """
+    base = Path(save_path)
+    if not base.is_dir():
+        raise FileNotFoundError(f"save_path not found: {save_path}")
+    run_dirs = sorted(
+        [p for p in base.iterdir() if p.is_dir() and p.name.startswith("run_")],
+        key=lambda p: int(p.name.split("_", 1)[1]),
+    )
+    if num_runs is not None:
+        run_dirs = [p for p in run_dirs if int(p.name.split("_", 1)[1]) <= int(num_runs)]
+    if not run_dirs:
+        raise FileNotFoundError(f"No run_* folders under {save_path}")
+    rows = []
+    for run_dir in run_dirs:
+        run_id = int(run_dir.name.split("_", 1)[1])
+        if experiments is not None:
+            exp_dirs = [run_dir / e for e in experiments]
+        else:
+            exp_dirs = sorted(run_dir.glob(experiment_glob))
+        for exp_dir in exp_dirs:
+            if not exp_dir.is_dir():
+                continue
+            summary_path = exp_dir / "experiment_summary.csv"
+            if not summary_path.exists():
+                continue
+            df = pd.read_csv(summary_path)
+            if df.empty:
+                continue
+            row0 = df.iloc[0]
+            meta = _parse_experiment_dir_name(exp_dir.name)
+            rows.append(
+                {
+                    "run": run_id,
+                    "experiment": exp_dir.name,
+                    "kind": meta["kind"],
+                    "init_width": meta["init_width"],
+                    "lambda_penalty": meta["lambda_penalty"],
+                    "model_label": str(row0.get("Model", meta["kind"])),
+                    "x": float(row0[x_col]),
+                    "y": float(row0[y_col]),
+                    "summary_path": str(summary_path),
+                }
+            )
+    if not rows:
+        raise FileNotFoundError(
+            f"No experiment_summary.csv files found under {save_path} "
+            f"(experiments={experiments}, glob={experiment_glob!r})."
+        )
+    return pd.DataFrame(rows)
+
+
+def _lambda_penalty_color_map(df, palette=None):
+    """Distinct color per plasticity lambda_penalty value."""
+    lambdas = sorted(
+        df.loc[df["kind"] == "plasticity", "lambda_penalty"].dropna().unique()
+    )
+    if palette is None:
+        palette = list(plt.cm.tab10.colors) + list(plt.cm.Set2.colors)
+    return {lam: palette[i % len(palette)] for i, lam in enumerate(lambdas)}
+
+
+def _point_style(row, style_map, lambda_colors):
+    kind = row["kind"]
+    if kind == "baseline":
+        return style_map["baseline"]
+    if kind == "plasticity":
+        lam = row.get("lambda_penalty")
+        if lam is not None and not pd.isna(lam) and lam in lambda_colors:
+            return {
+                "color": lambda_colors[lam],
+                "marker": style_map["plasticity"]["marker"],
+            }
+        return style_map["plasticity"]
+    return style_map["other"]
+
+
+def _legend_handles_for_test_acc_plot(df, style_map, lambda_colors):
+    handles = []
+    if (df["kind"] == "baseline").any():
+        handles.append(
+            Line2D(
+                [0], [0],
+                marker=style_map["baseline"]["marker"],
+                color="w",
+                markerfacecolor=style_map["baseline"]["color"],
+                markersize=8,
+                label="baseline",
+            )
+        )
+    for lam in sorted(lambda_colors.keys()):
+        handles.append(
+            Line2D(
+                [0], [0],
+                marker=style_map["plasticity"]["marker"],
+                color="w",
+                markerfacecolor=lambda_colors[lam],
+                markersize=8,
+                label=f"plasticity λ={lam:g}",
+            )
+        )
+    if (df["kind"] == "other").any():
+        handles.append(
+            Line2D(
+                [0], [0],
+                marker=style_map["other"]["marker"],
+                color="w",
+                markerfacecolor=style_map["other"]["color"],
+                markersize=8,
+                label="other",
+            )
+        )
+    return handles
+
+
+def plot_param_count_vs_test_acc(
+    save_path="results",
+    experiments=None,
+    experiment_glob="*",
+    num_runs=None,
+    aggregate_runs=True,
+    x_col="Parameters",
+    y_col="Test Acc",
+    xlabel="Parameter count",
+    ylabel="Test accuracy (%)",
+    title="Parameter count vs test accuracy",
+    save_path_out=None,
+    show=True,
+    figsize=(10, 7),
+    dpi=150,
+    alpha_individual=0.35,
+    marker_size=70,
+    annotate_points=False,
+    group_by="experiment",
+    style_map=None,
+    lambda_palette=None,
+):
+    """
+    Plot parameter count (x) against test accuracy (y) across experiments.
+    Typical usage
+    -------------
+    # All plasticity + baseline runs, aggregated over 5 seeds:
+    plot_param_count_vs_test_acc(
+        save_path="results",
+        experiment_glob="*",
+        num_runs=5,
+        aggregate_runs=True,
+        save_path_out="param_count_vs_test_acc_multi.png",
+    )
+    # Only one penalty, multiple init widths:
+    plot_param_count_vs_test_acc(
+        save_path="results",
+        experiment_glob="plasticity_*_1e-06",
+        experiments=None,
+        num_runs=5,
+    )
+    # Explicit list:
+    plot_param_count_vs_test_acc(
+        save_path="results",
+        experiments=[
+            "baseline_16", "baseline_32", "baseline_64",
+            "plasticity_16_1e-06", "plasticity_32_1e-06",
+        ],
+        num_runs=5,
+    )
+    Parameters
+    ----------
+    aggregate_runs : bool
+        If True, plot mean ± std per experiment group.
+        If False, plot every run as its own point.
+    group_by : str
+        Column used for aggregation / legend when aggregate_runs=True.
+        Options: "experiment", "kind", "init_width", "lambda_penalty".
+    style_map : dict or None
+        Optional override for baseline/other markers and fallback plasticity style.
+    lambda_palette : list or None
+        Colors assigned in order to distinct plasticity lambda_penalty values.
+        Defaults to tab10 + Set2.
+    """
+    df = collect_experiment_summaries(
+        save_path=save_path,
+        experiments=experiments,
+        experiment_glob=experiment_glob,
+        num_runs=num_runs,
+        x_col=x_col,
+        y_col=y_col,
+    )
+    if style_map is None:
+        style_map = {
+            "baseline": {"color": "black", "marker": "s"},
+            "plasticity": {"color": "#d62728", "marker": "o"},
+            "other": {"color": "gray", "marker": "x"},
+        }
+    lambda_colors = _lambda_penalty_color_map(df, palette=lambda_palette)
+    fig, ax = plt.subplots(figsize=figsize)
+    if not aggregate_runs:
+        for _, row in df.iterrows():
+            style = _point_style(row, style_map, lambda_colors)
+            ax.scatter(
+                row["x"], row["y"],
+                c=style["color"],
+                marker=style["marker"],
+                s=marker_size,
+                alpha=0.9,
+                edgecolors="black",
+                linewidths=0.4,
+            )
+        handles = _legend_handles_for_test_acc_plot(df, style_map, lambda_colors)
+        ax.legend(handles=handles, title="Model / λ penalty")
+    else:
+        grouped = (
+            df.groupby(group_by, dropna=False)
+            .agg(
+                x_mean=("x", "mean"),
+                x_std=("x", "std"),
+                y_mean=("y", "mean"),
+                y_std=("y", "std"),
+                kind=("kind", "first"),
+                lambda_penalty=("lambda_penalty", "first"),
+                n_runs=("run", "nunique"),
+            )
+            .reset_index()
+        )
+        for _, row in grouped.iterrows():
+            style = _point_style(row, style_map, lambda_colors)
+            ax.errorbar(
+                row["x_mean"], row["y_mean"],
+                xerr=row["x_std"] if pd.notna(row["x_std"]) else None,
+                yerr=row["y_std"] if pd.notna(row["y_std"]) else None,
+                fmt=style["marker"],
+                color=style["color"],
+                markersize=8,
+                capsize=3,
+                linestyle="none",
+                alpha=0.95,
+            )
+            if annotate_points:
+                ax.annotate(
+                    str(row[group_by]),
+                    (row["x_mean"], row["y_mean"]),
+                    textcoords="offset points",
+                    xytext=(4, 4),
+                    fontsize=8,
+                )
+        for _, row in df.iterrows():
+            style = _point_style(row, style_map, lambda_colors)
+            ax.scatter(
+                row["x"], row["y"],
+                color=style["color"],
+                marker=style["marker"],
+                s=marker_size * 0.5,
+                alpha=alpha_individual,
+                edgecolors="none",
+            )
+        handles = _legend_handles_for_test_acc_plot(df, style_map, lambda_colors)
+        ax.legend(handles=handles, title="Model / λ penalty")
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    if save_path_out is not None:
+        fig.savefig(save_path_out, dpi=dpi, bbox_inches="tight")
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+    return fig, ax, df
 
 if __name__ == "__main__":
     # df1=get_statistics(save_path="results", experiments=["plasticity_16_1e-08","plasticity_32_1e-08","plasticity_64_1e-08","plasticity_128_1e-08", "plasticity_256_1e-08"], num_runs=5)
@@ -1645,17 +2134,34 @@ if __name__ == "__main__":
     # print(df1["plasticity_64_1e-08"]["summary"])
     # print(df1["plasticity_128_1e-08"]["summary"])
     # print(df1["plasticity_256_1e-08"]["summary"])
-    for i in range(1,6):
-        print("Running experiment for run", i)
-        main(f"results/run_{i}")
-    print("All experiments completed.")
+
+    for hidden_sizes in [[16,16,16,16]]:
+        for lambda_penalty in [1e-8,1e-7,5e-7,1e-6,2e-6]:
+            set_seed(SEED)
+            for i in range(1,6):
+                print("Running experiment for run", i)
+                main(f"results_temp_maske_mode_none_bidirectional_unc/run_{i}", hidden_sizes, lambda_penalty)
+    # for hidden_sizes in [[256,256,256,256],[128,128,128,128]]:
+    #     for lambda_penalty in [2e-6]:
+    #         set_seed(SEED)
+    #         for i in range(1,6):
+    #             print("Running experiment for run", i)
+    #             main(f"results_temp_maske_mode_none_bidirectional_unc/run_{i}", hidden_sizes, lambda_penalty)
+    # print("All experiments completed.")
 #     plot_param_count(
-#     save_path="results",
+#     save_path="results_temp_maske_mode_none_bidirectional_unc",
 #     experiments=[
-#         "plasticity_16_1e-07",
-#         "plasticity_32_1e-07",
-#         "plasticity_64_1e-07",
-#         "plasticity_128_1e-07",
-#         "plasticity_256_1e-07",
+#         "plasticity_32_5e-07","plasticity_128_5e-07","plasticity_256_5e-07",
 #     ],
 # )
+
+    # plot_param_count_vs_test_acc(
+    #     save_path="results_temp_maske_mode_none_bidirectional_unc",
+    #     experiments=[
+    #         "baseline_16", "baseline_32", "baseline_48", "baseline_64",
+    #         "plasticity_256_2e-06","plasticity_256_1e-06","plasticity_256_5e-07","plasticity_256_1e-07","plasticity_256_1e-08"
+    #     ],
+    #     num_runs=5,
+    #     aggregate_runs=True,
+    #     save_path_out="param_count_vs_test_acc_multi.png",
+    # )

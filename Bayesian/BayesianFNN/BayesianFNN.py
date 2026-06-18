@@ -113,6 +113,55 @@ class BayesianFNN(nn.Module):
             average_uncertainty_per_layer.append(torch.sum(uncertainty)/uncertainty.numel())
         return average_uncertainty_per_layer
 
+    def _weight_variance(self, rho):
+        sigma = F.softplus(rho)
+        return sigma ** 2
+
+    def _neuron_uncertainty_incoming(self, layer):
+        """Mean incoming weight variance per output neuron (row j of rho_w)."""
+        var_w = self._weight_variance(layer.rho_w)
+        return var_w.mean(dim=1)
+
+    def _neuron_uncertainty_outgoing(self, next_layer, neuron_idx):
+        """Mean outgoing weight variance for hidden neuron j via column j of the next layer."""
+        var_w = self._weight_variance(next_layer.rho_w)
+        return var_w[:, neuron_idx].mean()
+
+    def _neuron_uncertainty_bidirectional(
+        self, layer_idx, neuron_idx, combine="geometric", eps=1e-8
+    ):
+        """
+        Combined weight variance uncertainty for neuron j in hidden layer layer_idx.
+        combine: 'geometric' (sqrt(in*out)), 'min', or 'mean'
+        """
+        layer = self.layers[layer_idx]
+        unc_in = self._neuron_uncertainty_incoming(layer)[neuron_idx]
+        if layer_idx + 1 < len(self.layers):
+            unc_out = self._neuron_uncertainty_outgoing(
+                self.layers[layer_idx + 1], neuron_idx
+            )
+        else:
+            unc_out = self._neuron_uncertainty_outgoing(self.out, neuron_idx)
+        if combine == "min":
+            return torch.min(unc_in, unc_out)
+        if combine == "mean":
+            return 0.5 * (unc_in + unc_out)
+        return torch.sqrt(unc_in * unc_out + eps)
+
+    def get_average_bidirectional_uncertainty_per_layer(self, combine="geometric", eps=1e-8):
+        """Mean bidirectional weight-variance uncertainty per hidden layer."""
+        average_uncertainty_per_layer = []
+        for layer_idx, layer in enumerate(self.layers):
+            n_neurons = layer.mu_w.shape[0]
+            scores = [
+                self._neuron_uncertainty_bidirectional(
+                    layer_idx, j, combine=combine, eps=eps
+                )
+                for j in range(n_neurons)
+            ]
+            average_uncertainty_per_layer.append(torch.stack(scores).mean())
+        return average_uncertainty_per_layer
+
 
 def test_model_shape():
     print("Testing model shape...")
