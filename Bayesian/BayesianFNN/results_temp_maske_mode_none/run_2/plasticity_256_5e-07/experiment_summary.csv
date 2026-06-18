@@ -1,2 +1,0 @@
-Model,Parameters,Trainable Params,Best Val Acc,Best Val Brier,Test Acc,Test Brier,Hidden Sizes,Lambda Penalty,Selected checkpoint metric,Selected epoch,Selected val_total
-plasticity,122532,122532,89.275,0.1604427096048991,87.45,0.18170763244628907,"[62, 62, 62, 62]",5e-07,val_total,107,0.41345229744911194
