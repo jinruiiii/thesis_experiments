@@ -1424,7 +1424,7 @@ if __name__ == "__main__":
     # Example: same-start static baseline + one plasticity lambda.
     # Uncomment to run. Prefer conservative phase1_epochs and inspect Phase-1 val curves.
     phase1_epochs = 30
-    phase2_epochs = 300
+    phase2_epochs = 30
 
     # hidden_sizes = [400,400]
     # # for r in [0.05,0.125,0.25,0.375,0.5]:
