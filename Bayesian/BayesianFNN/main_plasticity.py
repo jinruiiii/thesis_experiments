@@ -1299,11 +1299,26 @@ def warm_start_model_on_batches(
     mask_mode= None,
     layer_idx= None,
     old_width= None,
+    grow_new_only_steps=None,
 ):
     """
     K gradient steps cycling through a list of warm-start batches.
     Trains all params (as in your current warm_start_model), but on multiple batches.
+
+    When mask_mode == "grow_new_only", the new-neuron gradient mask is applied only for
+    the first grow_new_only_steps steps (default: all K steps). Remaining steps update
+    all parameters with no mask.
     """
+    K = int(K)
+    if grow_new_only_steps is None:
+        new_only_limit = K
+    else:
+        new_only_limit = int(grow_new_only_steps)
+        if new_only_limit < 0 or new_only_limit > K:
+            raise ValueError(
+                f"grow_new_only_steps must be in [0, K={K}], got {grow_new_only_steps!r}"
+            )
+
     optimizer = optim.Adam(model.parameters(), lr=eta_ws)
     model.train()
     for step in range(K):
@@ -1315,7 +1330,8 @@ def warm_start_model_on_batches(
             outputs, labels, model.kl_loss(), beta_scaled, lambda_penalty, param_count
         )
         loss.backward()
-        if mask_mode == "grow_new_only":
+        use_new_only = mask_mode == "grow_new_only" and step < new_only_limit
+        if use_new_only:
             _mask_warm_start_grads_grow_new_only(model, layer_idx=layer_idx, old_width=old_width)
         optimizer.step()
 
@@ -1399,11 +1415,14 @@ def structural_decision_juncture(
     prune_mode="per_layer",
     global_prune_budget="params",
     global_prune_normalize="percentile",
+    grow_new_only_steps=None,
 ):
     """
     Evaluate growth and/or prune candidates via delta penalised ELBO on B_val.
     Deltas are relative to a warm-started baseline (same K steps as candidates).
     junctures_mode: "both" (grow+prune), "grow" (grow only), or "prune" (prune only).
+    grow_new_only_steps: for grow warm-start, apply new-only mask for this many initial
+    steps (default None = all K steps); remaining steps update all parameters.
     Returns (action, model, hidden_sizes, info_dict).
     """
     if junctures_mode not in ("both", "grow", "prune"):
@@ -1412,12 +1431,21 @@ def structural_decision_juncture(
         )
     train_dataset_size = len(train_loader.dataset)
     beta_scaled = (1 / train_dataset_size) * beta
+    K = int(K)
+    if grow_new_only_steps is None:
+        resolved_grow_new_only_steps = K
+    else:
+        resolved_grow_new_only_steps = int(grow_new_only_steps)
+        if resolved_grow_new_only_steps < 0 or resolved_grow_new_only_steps > K:
+            raise ValueError(
+                f"grow_new_only_steps must be in [0, K={K}], got {grow_new_only_steps!r}"
+            )
 
     #_print_neuron_snr_by_layer(model, snr_combine=snr_combine)
 
     # choose how many batches
-    M_ws = 40     # warm-start batches
-    M_val = 10    # evaluation batches
+    M_ws = 32     # warm-start batches
+    M_val = 20    # evaluation batches
 
     batches_ws = sample_batches(train_loader, device, M_ws)
     batches_val = sample_batches(val_loader, device, M_val)
@@ -1451,6 +1479,7 @@ def structural_decision_juncture(
         'prune_neurons_pruned': None,
         'growth_layer_score': growth_layer_score,
         'growth_mad_percentile': growth_mad_percentile,
+        'grow_new_only_steps': resolved_grow_new_only_steps,
     }
     if grow_exclude_layers is None:
         grow_exclude_layers = []
@@ -1481,6 +1510,7 @@ def structural_decision_juncture(
             mask_mode="grow_new_only",
             layer_idx=layer_idx,
             old_width=old_width,
+            grow_new_only_steps=resolved_grow_new_only_steps,
         )
         L_after_grow = penalised_elbo_on_batches(
             grow_model, batches_val, beta_scaled, lambda_penalty
@@ -1574,7 +1604,8 @@ def structural_decision_juncture(
     print(
         f"\nStructural decision (mode={junctures_mode}, prune_mode={prune_mode}, "
         f"global_prune_budget={global_prune_budget}, "
-        f"global_prune_normalize={global_prune_normalize}): "
+        f"global_prune_normalize={global_prune_normalize}, "
+        f"grow_new_only_steps={resolved_grow_new_only_steps}/{K}): "
         f"L_before={L_before:.4f}, L_after_none={L_after_none:.4f}, "
         f"delta_grow={delta_grow_str}, delta_prune={info['delta_prune']}, "
         f"action={best_action}{prune_log}"
@@ -2032,6 +2063,7 @@ def run_plasticity_then_three_phase(
     growth_layer_idx,
     growth_gamma,
     resume_from_plasticity_dir=None,
+    grow_new_only_steps=None,
 ):
     """
     Run plasticity, then grow-train-prune-train refinement on its best checkpoint.
@@ -2089,6 +2121,7 @@ def run_plasticity_then_three_phase(
             global_prune_budget=global_prune_budget,
             global_prune_normalize=global_prune_normalize,
             checkpoint_metric=checkpoint_metric,
+            grow_new_only_steps=grow_new_only_steps,
         )
         plasticity_ckpt_path = os.path.join(plasticity_output_dir, "best_checkpoint.pth")
         if not os.path.exists(plasticity_ckpt_path):
@@ -2433,6 +2466,7 @@ def run_adaptive_experiment(
     global_prune_budget="params",
     global_prune_normalize="percentile",
     checkpoint_metric="val_loss_total",
+    grow_new_only_steps=None,
 ):
     """
     Dynamic structural adaptation via penalised ELBO.
@@ -2445,6 +2479,8 @@ def run_adaptive_experiment(
     growth_layer_score: "mean" or "mad" for which layer to expand on grow.
     growth_mad_percentile: percentile of within-layer MAD z-scores when growth_layer_score="mad".
     checkpoint_metric: "val_loss_nll" or "val_loss_total" for best-checkpoint selection.
+    grow_new_only_steps: first N grow warm-start steps use new-only mask; rest update all
+    (default None = all warm_start_steps are new-only).
     """
     if output_dir is None:
         output_dir = os.path.join('./results', experiment_name)
@@ -2455,6 +2491,13 @@ def run_adaptive_experiment(
     checkpoint_metric = _normalize_checkpoint_metric(checkpoint_metric)
     checkpoint_metric_label = _checkpoint_metric_label(checkpoint_metric)
     print(f"Checkpoint selection metric: {checkpoint_metric_label}")
+    resolved_grow_new_only_steps = (
+        warm_start_steps if grow_new_only_steps is None else int(grow_new_only_steps)
+    )
+    print(
+        f"Grow warm-start: new_only_steps={resolved_grow_new_only_steps}/{warm_start_steps} "
+        f"(remaining steps update all params)"
+    )
     if decision_warmup_epochs > 0:
         print(f"Structural juncture warmup: {decision_warmup_epochs} epoch(s) of weight-only training")
     if decision_cooldown_epochs > 0:
@@ -2495,6 +2538,7 @@ def run_adaptive_experiment(
         'structural_prune_neurons_pruned': [],
         'structural_global_prune_budget': [],
         'structural_global_prune_normalize': [],
+        'structural_grow_new_only_steps': [],
         'param_count_history': [],
         'junctures_mode': junctures_mode,
     }
@@ -2598,6 +2642,7 @@ def run_adaptive_experiment(
                 prune_mode=prune_mode,
                 global_prune_budget=global_prune_budget,
                 global_prune_normalize=global_prune_normalize,
+                grow_new_only_steps=grow_new_only_steps,
             )
             metrics['structural_epochs'].append(epoch)
             metrics['structural_actions'].append(action)
@@ -2613,6 +2658,9 @@ def run_adaptive_experiment(
             metrics['structural_global_prune_budget'].append(info.get('global_prune_budget'))
             metrics['structural_global_prune_normalize'].append(
                 info.get('global_prune_normalize')
+            )
+            metrics['structural_grow_new_only_steps'].append(
+                info.get('grow_new_only_steps')
             )
 
             if action != 'none':
@@ -2727,6 +2775,7 @@ def run_adaptive_experiment(
         'prune_neurons_pruned': metrics['structural_prune_neurons_pruned'],
         'global_prune_budget': metrics['structural_global_prune_budget'],
         'global_prune_normalize': metrics['structural_global_prune_normalize'],
+        'grow_new_only_steps': metrics['structural_grow_new_only_steps'],
     })
     structural_df.to_csv(os.path.join(output_dir, 'structural_decisions.csv'), index=False)
 
@@ -2784,7 +2833,7 @@ def main(
             f"run_mode must be one of {sorted(allowed_run_modes)}, got {run_mode!r}"
         )
     # Hyperparameters
-    num_epochs = 30
+    num_epochs = 50 if run_mode == "plasticity" else 30
     batch_size = 256
     learning_rate = 0.005
     beta = 0.002
@@ -2794,7 +2843,7 @@ def main(
     decision_warmup_epochs = 0
     decision_cooldown_epochs = 0
 
-    gamma = 0.02
+    gamma = 0.0
     rho = 0.1
     if three_phase_growth_gamma is None:
         three_phase_growth_gamma = gamma
@@ -2804,8 +2853,9 @@ def main(
     global_prune_budget = "neurons"  # "params" or "neurons"
     global_prune_normalize = "mad"  # "percentile", "zscore", "mad", or "raw"
 
-    warm_start_steps = 80
-    warm_start_lr = 0.001
+    warm_start_steps = 32
+    warm_start_lr = 0.002
+    grow_new_only_steps = 8  
     
     # Create results directory
     os.makedirs(f'{save_path}', exist_ok=True)
@@ -2959,6 +3009,7 @@ def main(
             global_prune_budget=global_prune_budget,
             global_prune_normalize=global_prune_normalize,
             checkpoint_metric=checkpoint_metric,
+            grow_new_only_steps=grow_new_only_steps,
         )
 
     if run_mode in ("plasticity_and_hybrid", "hybrid"):
@@ -2998,6 +3049,7 @@ def main(
             growth_layer_idx=three_phase_growth_layer_idx,
             growth_gamma=three_phase_growth_gamma,
             resume_from_plasticity_dir=resume_from_plasticity_dir,
+            grow_new_only_steps=grow_new_only_steps,
         )
     
     # # ========== Compare Results ==========
@@ -3399,7 +3451,9 @@ def _parse_experiment_dir_name(dirname):
       plasticity_300_1e-06_grow_only
       static_replay_400_1e-06
       static_replay_400_1e-06_prune_only
-    Returns dict with keys: kind, init_width, lambda_penalty, junctures_mode, label, dir_tags.
+      nest_300_100_p0.1_refacc89_flooracc89
+    Returns dict with keys: kind, init_width, lambda_penalty, junctures_mode, label, dir_tags
+    (plus nest_p / nest_ref_acc / nest_floor_acc for Nest folders).
     """
     raw_name = str(dirname)
     name, dir_tags = _strip_optional_experiment_dir_tags(raw_name)
@@ -3574,6 +3628,26 @@ def _parse_experiment_dir_name(dirname):
             "junctures_mode": "both",
             "label": f"plasticity {channels} λ={lam:g}",
         })
+    m = re.match(
+        r"^nest_(\d+)_(\d+)_p([0-9.e+-]+)_refacc([0-9.e+-]+)_flooracc([0-9.e+-]+)$",
+        name,
+    )
+    if m:
+        w1 = int(m.group(1))
+        w2 = int(m.group(2))
+        nest_p = float(m.group(3))
+        nest_ref_acc = float(m.group(4))
+        nest_floor_acc = float(m.group(5))
+        return _with_tags({
+            "kind": "nest",
+            "init_width": w1,
+            "lambda_penalty": None,
+            "junctures_mode": "nest",
+            "nest_p": nest_p,
+            "nest_ref_acc": nest_ref_acc,
+            "nest_floor_acc": nest_floor_acc,
+            "label": f"nest {w1}/{w2} p={nest_p:g} floor={nest_floor_acc:g}",
+        })
     return _with_tags({
         "kind": "other",
         "init_width": None,
@@ -3650,6 +3724,9 @@ def collect_experiment_summaries(
                     "init_width": meta["init_width"],
                     "lambda_penalty": meta["lambda_penalty"],
                     "junctures_mode": junctures_mode,
+                    "nest_p": meta.get("nest_p"),
+                    "nest_ref_acc": meta.get("nest_ref_acc"),
+                    "nest_floor_acc": meta.get("nest_floor_acc"),
                     "model_label": str(row0.get("Model", meta["kind"])),
                     "x": float(row0[x_col]),
                     "y": float(row0[y_col]),
@@ -3676,6 +3753,17 @@ def _lambda_penalty_color_map(df, palette=None):
     return {lam: palette[i % len(palette)] for i, lam in enumerate(lambdas)}
 
 
+def _nest_floor_color_map(df, palette=None):
+    """Distinct color per Nest prune-acc floor value."""
+    floors = sorted(
+        df.loc[df["kind"] == "nest", "nest_floor_acc"].dropna().unique()
+    )
+    if palette is None:
+        # Prefer a warm / distinct range from plasticity λ tab10 blues/reds.
+        palette = list(plt.cm.Dark2.colors) + list(plt.cm.Set1.colors)
+    return {floor: palette[i % len(palette)] for i, floor in enumerate(floors)}
+
+
 def _junctures_mode_marker(mode):
     if mode == "grow":
         return "^"
@@ -3692,7 +3780,7 @@ def _plasticity_point_color(row, style_map, lambda_colors):
     return style_map["plasticity"]["color"]
 
 
-def _point_style(row, style_map, lambda_colors, style_by_junctures=False):
+def _point_style(row, style_map, lambda_colors, style_by_junctures=False, nest_floor_colors=None):
     kind = row["kind"]
     if kind == "baseline":
         color = style_map["baseline"]["color"]
@@ -3732,6 +3820,25 @@ def _point_style(row, style_map, lambda_colors, style_by_junctures=False):
             "facecolor": "white",
             "edgecolor": color,
             "linewidth": 1.0,
+        }
+    if kind == "nest":
+        style = style_map.get("nest", {"color": "#ff7f0e", "marker": "v"})
+        floor = row.get("nest_floor_acc")
+        if (
+            nest_floor_colors is not None
+            and floor is not None
+            and not pd.isna(floor)
+            and floor in nest_floor_colors
+        ):
+            color = nest_floor_colors[floor]
+        else:
+            color = style["color"]
+        return {
+            "color": color,
+            "marker": style["marker"],
+            "facecolor": color,
+            "edgecolor": "black",
+            "linewidth": 0.4,
         }
     if kind == "plasticity":
         mode = row.get("junctures_mode")
@@ -3836,6 +3943,15 @@ def _draw_kind_pareto_frontier(ax, df, kind, color, label, y_goal="maximize", li
 _PARETO_SPLIT_BY_INIT_WIDTH_KINDS = frozenset(
     {"plasticity", "static_replay", "plasticity_three_phase"}
 )
+# Same kinds can also be split by grow/prune juncture mode.
+_PARETO_SPLIT_BY_JUNCTURES_KINDS = frozenset(
+    {"plasticity", "static_replay", "plasticity_three_phase"}
+)
+_DEFAULT_JUNCTURES_PARETO_LINESTYLES = {
+    "both": "-",
+    "prune": "--",
+    "grow": ":",
+}
 
 
 def _init_width_pareto_colors(widths):
@@ -3860,14 +3976,39 @@ def _init_width_pareto_colors(widths):
     return {w: palette[i % len(palette)] for i, w in enumerate(widths_sorted)}
 
 
-def _resolve_pareto_linestyle(pareto_linestyle, kind, init_width=None):
+def _normalize_junctures_mode_for_pareto(mode):
+    if mode is None or (isinstance(mode, float) and pd.isna(mode)):
+        return "both"
+    mode = str(mode)
+    return mode if mode else "both"
+
+
+def _resolve_pareto_linestyle(pareto_linestyle, kind, init_width=None, junctures_mode=None):
     if not isinstance(pareto_linestyle, dict):
+        if junctures_mode is not None and pareto_linestyle == "--":
+            # Default string "--" still allows mode-specific styles when splitting.
+            return _DEFAULT_JUNCTURES_PARETO_LINESTYLES.get(
+                _normalize_junctures_mode_for_pareto(junctures_mode), pareto_linestyle
+            )
         return pareto_linestyle
+    mode = (
+        _normalize_junctures_mode_for_pareto(junctures_mode)
+        if junctures_mode is not None
+        else None
+    )
+    if mode is not None and (kind, mode) in pareto_linestyle:
+        return pareto_linestyle[(kind, mode)]
+    if mode is not None and mode in pareto_linestyle:
+        return pareto_linestyle[mode]
     if init_width is not None and (kind, init_width) in pareto_linestyle:
         return pareto_linestyle[(kind, init_width)]
     if init_width is not None and init_width in pareto_linestyle:
         return pareto_linestyle[init_width]
-    return pareto_linestyle.get(kind, "--")
+    if kind in pareto_linestyle:
+        return pareto_linestyle[kind]
+    if mode is not None:
+        return _DEFAULT_JUNCTURES_PARETO_LINESTYLES.get(mode, "--")
+    return "--"
 
 
 def _draw_kind_pareto_frontiers(
@@ -3879,16 +4020,55 @@ def _draw_kind_pareto_frontiers(
     linestyle="--",
     linewidth=1.5,
     split_by_init_width=False,
+    split_by_junctures_mode=False,
     init_width_colors=None,
 ):
     """
     Draw one or more Pareto frontiers for a kind.
     If split_by_init_width and kind is plasticity-like, draw a frontier per init_width.
+    If split_by_junctures_mode and kind is plasticity-like, draw a frontier per
+    junctures_mode (both / prune / grow).
     Returns a list of legend handles.
     """
     handles = []
     subset = df.loc[df["kind"] == kind]
     if subset.empty:
+        return handles
+
+    if split_by_junctures_mode and kind in _PARETO_SPLIT_BY_JUNCTURES_KINDS:
+        if "junctures_mode" not in subset.columns:
+            handle = _draw_pareto_frontier(
+                ax,
+                subset,
+                color=color,
+                label=f"{kind} Pareto",
+                y_goal=y_goal,
+                linestyle=_resolve_pareto_linestyle(linestyle, kind),
+                linewidth=linewidth,
+            )
+            if handle is not None:
+                handles.append(handle)
+            return handles
+
+        mode_series = subset["junctures_mode"].map(_normalize_junctures_mode_for_pareto)
+        work = subset.assign(junctures_mode=mode_series)
+        for mode, sub in work.groupby("junctures_mode", dropna=False):
+            mode_label = _normalize_junctures_mode_for_pareto(mode)
+            label = f"{kind} {mode_label} Pareto"
+            ls = _resolve_pareto_linestyle(
+                linestyle, kind, junctures_mode=mode_label
+            )
+            handle = _draw_pareto_frontier(
+                ax,
+                sub,
+                color=color,
+                label=label,
+                y_goal=y_goal,
+                linestyle=ls,
+                linewidth=linewidth,
+            )
+            if handle is not None:
+                handles.append(handle)
         return handles
 
     if split_by_init_width and kind in _PARETO_SPLIT_BY_INIT_WIDTH_KINDS:
@@ -3945,8 +4125,16 @@ def _draw_kind_pareto_frontiers(
     return handles
 
 
-def _legend_handles_for_test_acc_plot(df, style_map, lambda_colors, style_by_junctures=False):
+def _legend_handles_for_test_acc_plot(
+    df,
+    style_map,
+    lambda_colors,
+    style_by_junctures=False,
+    nest_floor_colors=None,
+):
     handles = []
+    if nest_floor_colors is None:
+        nest_floor_colors = {}
     if (df["kind"] == "baseline").any():
         handles.append(
             Line2D(
@@ -4039,6 +4227,38 @@ def _legend_handles_for_test_acc_plot(df, style_map, lambda_colors, style_by_jun
                     markeredgewidth=1.0,
                     markersize=8,
                     label=f"static replay λ={lam:g}",
+                )
+            )
+    nest_df = df.loc[df["kind"] == "nest"]
+    if not nest_df.empty:
+        nest_style = style_map.get("nest", {"color": "#ff7f0e", "marker": "v"})
+        floors = sorted(nest_df["nest_floor_acc"].dropna().unique())
+        if floors:
+            for floor in floors:
+                color = nest_floor_colors.get(floor, nest_style["color"])
+                handles.append(
+                    Line2D(
+                        [0], [0],
+                        marker=nest_style["marker"],
+                        color="w",
+                        markerfacecolor=color,
+                        markeredgecolor="black",
+                        markeredgewidth=0.4,
+                        markersize=8,
+                        label=f"nest floor={floor:g}",
+                    )
+                )
+        else:
+            handles.append(
+                Line2D(
+                    [0], [0],
+                    marker=nest_style["marker"],
+                    color="w",
+                    markerfacecolor=nest_style["color"],
+                    markeredgecolor="black",
+                    markeredgewidth=0.4,
+                    markersize=8,
+                    label="nest",
                 )
             )
     if (df["kind"] == "other").any():
@@ -4143,23 +4363,26 @@ def plot_param_count_vs_test_acc(
         "global" for one frontier over all points;
         "per_kind" for separate baseline/plasticity lines;
         "per_init_width" like per_kind, but plasticity / static_replay /
-        plasticity_three_phase get a separate frontier per initial width.
+        plasticity_three_phase get a separate frontier per initial width;
+        "per_junctures_mode" like per_kind, but plasticity-like kinds get a
+        separate frontier per junctures_mode (both / prune / grow).
     pareto_y_goal : str or None
         "maximize" or "minimize" for the y-axis objective. If None, inferred from y_col/ylabel
         (e.g. Test Brier -> minimize, Test Acc -> maximize).
     pareto_frontier_kinds : tuple of str
         Which experiment kinds receive a frontier line when pareto_scope is
-        "per_kind" or "per_init_width".
+        "per_kind", "per_init_width", or "per_junctures_mode".
     pareto_linestyle : str or dict
         Line style for frontier(s); dict maps kind -> linestyle, or init_width /
-        (kind, init_width) when using per_init_width.
+        (kind, init_width) when using per_init_width, or junctures_mode /
+        (kind, junctures_mode) when using per_junctures_mode.
     pareto_linewidth : float
         Width of frontier lines.
     """
-    if pareto_scope not in ("global", "per_kind", "per_init_width"):
+    if pareto_scope not in ("global", "per_kind", "per_init_width", "per_junctures_mode"):
         raise ValueError(
-            f"pareto_scope must be 'global', 'per_kind', or 'per_init_width', "
-            f"got {pareto_scope!r}"
+            f"pareto_scope must be 'global', 'per_kind', 'per_init_width', or "
+            f"'per_junctures_mode', got {pareto_scope!r}"
         )
     df = collect_experiment_summaries(
         save_path=save_path,
@@ -4176,9 +4399,11 @@ def plot_param_count_vs_test_acc(
             "plasticity_three_phase": {"color": "#9467bd", "marker": "P"},
             "plasticity": {"color": "#d62728", "marker": "o"},
             "static_replay": {"color": "#2ca02c", "marker": "X"},
+            "nest": {"color": "#ff7f0e", "marker": "v"},
             "other": {"color": "gray", "marker": "x"},
         }
     lambda_colors = _lambda_penalty_color_map(df, palette=lambda_palette)
+    nest_floor_colors = _nest_floor_color_map(df, palette=lambda_palette)
     plasticity_modes = df.loc[df["kind"] == "plasticity", "junctures_mode"].dropna().unique()
     style_by_junctures = (
         style_by == "junctures_mode"
@@ -4188,7 +4413,9 @@ def plot_param_count_vs_test_acc(
     grouped = None
     if not aggregate_runs:
         for _, row in df.iterrows():
-            style = _point_style(row, style_map, lambda_colors, style_by_junctures)
+            style = _point_style(
+                row, style_map, lambda_colors, style_by_junctures, nest_floor_colors
+            )
             _scatter_point(ax, row["x"], row["y"], style, marker_size)
     else:
         grouped = (
@@ -4202,12 +4429,16 @@ def plot_param_count_vs_test_acc(
                 init_width=("init_width", "first"),
                 lambda_penalty=("lambda_penalty", "first"),
                 junctures_mode=("junctures_mode", "first"),
+                nest_floor_acc=("nest_floor_acc", "first"),
+                nest_p=("nest_p", "first"),
                 n_runs=("run", "nunique"),
             )
             .reset_index()
         )
         for _, row in grouped.iterrows():
-            style = _point_style(row, style_map, lambda_colors, style_by_junctures)
+            style = _point_style(
+                row, style_map, lambda_colors, style_by_junctures, nest_floor_colors
+            )
             ax.errorbar(
                 row["x_mean"], row["y_mean"],
                 xerr=row["x_std"] if pd.notna(row["x_std"]) else None,
@@ -4231,7 +4462,9 @@ def plot_param_count_vs_test_acc(
                     fontsize=8,
                 )
         for _, row in df.iterrows():
-            style = _point_style(row, style_map, lambda_colors, style_by_junctures)
+            style = _point_style(
+                row, style_map, lambda_colors, style_by_junctures, nest_floor_colors
+            )
             _scatter_point(
                 ax, row["x"], row["y"], style, marker_size * 0.5, alpha=alpha_individual
             )
@@ -4247,6 +4480,7 @@ def plot_param_count_vs_test_acc(
                     x=("x", "mean"),
                     y=("y", "mean"),
                     init_width=("init_width", "first"),
+                    junctures_mode=("junctures_mode", "first"),
                 )
                 .reset_index()
             )
@@ -4259,6 +4493,7 @@ def plot_param_count_vs_test_acc(
             )["color"],
             "plasticity": style_map["plasticity"]["color"],
             "static_replay": style_map.get("static_replay", {"color": "#2ca02c"})["color"],
+            "nest": style_map.get("nest", {"color": "#ff7f0e"})["color"],
             "other": style_map["other"]["color"],
         }
         if pareto_scope == "global":
@@ -4275,6 +4510,7 @@ def plot_param_count_vs_test_acc(
                 pareto_handles.append(handle)
         else:
             split_by_init_width = pareto_scope == "per_init_width"
+            split_by_junctures_mode = pareto_scope == "per_junctures_mode"
             width_colors = None
             if split_by_init_width and "init_width" in pareto_source.columns:
                 width_colors = _init_width_pareto_colors(
@@ -4298,15 +4534,20 @@ def plot_param_count_vs_test_acc(
                         linestyle=pareto_linestyle,
                         linewidth=pareto_linewidth,
                         split_by_init_width=split_by_init_width,
+                        split_by_junctures_mode=split_by_junctures_mode,
                         init_width_colors=width_colors,
                     )
                 )
 
     handles = _legend_handles_for_test_acc_plot(
-        df, style_map, lambda_colors, style_by_junctures
+        df,
+        style_map,
+        lambda_colors,
+        style_by_junctures,
+        nest_floor_colors=nest_floor_colors,
     )
     handles.extend(pareto_handles)
-    legend_title = "Model / λ / junctures" if style_by_junctures else "Model / λ penalty"
+    legend_title = "Model / λ / junctures" if style_by_junctures else "Model / λ / nest floor"
     ax.legend(handles=handles, title=legend_title)
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
@@ -4332,52 +4573,68 @@ if __name__ == "__main__":
 
 
 
-    # KMNIST example (use a separate save_path to keep results distinct from Fashion-MNIST):
-    hidden_sizes = [500, 500]
-    for lambda_penalty in [0,5e-08,5e-07,5e-06,1e-06]:
-        for junctures_mode in ["both"]:
-            for i in range(1, 6):
-                set_seed(SEED+i)
-                print("Running kmnist experiment for run", i, f"(junctures_mode={junctures_mode})")
-                main(
-                    f"results_Kmnist_FNN1/run_{i}",
-                    hidden_sizes,
-                    lambda_penalty,
-                    junctures_mode=junctures_mode,
-                    dataset="kmnist",
-                    run_mode="plasticity",
-                )
-    print("All FashionMnist experiments completed.")
+
+    # hidden_sizes = [500, 500]
+    # for lambda_penalty in [0,1e-07,5e-07,1e-06,5e-06]:
+    #     for junctures_mode in ["both"]:
+    #         for i in range(1, 6):
+    #             set_seed(SEED+i)
+    #             print("Running Fashion experiment for run", i, f"(junctures_mode={junctures_mode})")
+    #             main(
+    #                 f"results_FashionMnist_FNN_grow1_wstrain64_lr0.002_grownew64_wsval32/run_{i}",
+    #                 hidden_sizes,
+    #                 lambda_penalty,
+    #                 junctures_mode=junctures_mode,
+    #                 dataset="fashion_mnist",
+    #                 run_mode="plasticity",
+    #             )
+    # print("All FashionMnist experiments completed.")
+
+    # hidden_sizes = [500, 500]
+    # for lambda_penalty in [0,1e-07,5e-07,1e-06,5e-06]:
+    #     for junctures_mode in ["prune"]:
+    #         for i in range(1, 6):
+    #             set_seed(SEED+i)
+    #             print("Running Fashion experiment for run", i, f"(junctures_mode={junctures_mode})")
+    #             main(
+    #                 f"results_FashionMnist_FNN_grow1_ws32_lr0.002_grownew8/run_{i}",
+    #                 hidden_sizes,
+    #                 lambda_penalty,
+    #                 junctures_mode=junctures_mode,
+    #                 dataset="fashion_mnist",
+    #                 run_mode="plasticity",
+    #             )
+    # print("All FashionMnist experiments completed.")
 
 
-    # hidden_sizes = [400,400]
-    # for r in [0.05,0.125,0.25,0.375,0.5]:
+
+    # for hidden_size in [[75,75],[125,125],[175,175]]:
     #     for lambda_penalty in [0]:
     #         for junctures_mode in ["both"]:
     #             for i in range(1,6):
     #                 set_seed(SEED+i)
     #                 print("Running experiment for run", i, f"(junctures_mode={junctures_mode})")
     #                 main(
-    #                     f"results_Kmnist_FNN/run_{i}",
-    #                     [int(hidden_size * r) for hidden_size in hidden_sizes],
+    #                     f"results_FashionMnist_FNN_grow1/run_{i}",
+    #                     hidden_size,
     #                     lambda_penalty,
     #                     junctures_mode=junctures_mode,
-    #                     dataset="kmnist",
+    #                     dataset="fashion_mnist",
     #                     run_mode="baseline",
     #                 )
     # print("All experiments completed.")
 
 
-    # hidden_sizes = [400,400]
-    # for r in [0.05,0.125,0.25,0.375,0.5]:
+
+    # for hidden_size in [[75,75],[125,125],[175,175]]:
     #     for lambda_penalty in [1e-06]:
     #         for junctures_mode in ["both"]:
     #             for i in range(1,6):
     #                 set_seed(SEED+i)
     #                 print("Running experiment for run", i, f"(junctures_mode={junctures_mode})")
     #                 main(
-    #                     f"results_FashionMnist_FNN3/run_{i}",
-    #                     [int(hidden_size * r) for hidden_size in hidden_sizes],
+    #                     f"results_FashionMnist_FNN_grow1/run_{i}",
+    #                     hidden_size,
     #                     lambda_penalty,
     #                     junctures_mode=junctures_mode,
     #                     dataset="fashion_mnist",
@@ -4388,31 +4645,12 @@ if __name__ == "__main__":
     # print("All experiments completed.")
 
 
-    # for lambda_penalty in [0,5e-08,5e-07,5e-06,1e-06]:
-    #     for i in range(1,6):
-    #         set_seed(SEED+i)
-    #         print("Running experiment for run", i)
-    #         main(
-    #             f"results_FashionMnist_FNN3/run_{i}",
-    #             [100, 100],
-    #             lambda_penalty,
-    #             phase2_epochs=10,
-    #             phase3_epochs=10,
-    #             three_phase_growth_layer_idx=1,
-    #             three_phase_growth_gamma=1,
-    #             resume_from_plasticity_dir=(
-    #                 f"results_FashionMnist_FNN3/run_{i}/plasticity_500_{lambda_penalty}"
-    #             ),
-    #             dataset="fashion_mnist",
-    #             run_mode="hybrid",
-    #         )
-
     # # Static replay: train a fixed FNN using Hidden Sizes from each plasticity run's summary.
-    # for lambda_penalty in [0,5e-08,5e-07,1e-06,5e-06]:
+    # for lambda_penalty in [0,1e-07,5e-07,1e-06,5e-06]:
     #     for i in range(1, 6):
     #         set_seed(SEED+i)
     #         plasticity_dir = (
-    #             f"results_FashionMnist_FNN3/run_{i}/plasticity_500_{_format_lambda_dir(lambda_penalty)}"
+    #             f"results_FashionMnist_FNN_grow1_ws32_lr0.002_grownew8/run_{i}/plasticity_500_{_format_lambda_dir(lambda_penalty)}"
     #         )
     #         print(
     #             "Running static replay for run",
@@ -4420,7 +4658,7 @@ if __name__ == "__main__":
     #             f"(source={plasticity_dir})",
     #         )
     #         main(
-    #             f"results_FashionMnist_FNN2/run_{i}",
+    #             f"results_FashionMnist_FNN_grow1_ws32_lr0.002_grownew8/run_{i}",
     #             [500, 500],  # unused for architecture; taken from plasticity summary
     #             lambda_penalty=0,
     #             dataset="fashion_mnist",
@@ -4505,30 +4743,56 @@ if __name__ == "__main__":
     #     ylabel="Test Acc",
     # )
 
-    # plot_param_count_vs_test_acc(
-    #     save_path="results_FashionMnist_FNN3",
-    #     experiments=[
-    #        "baseline_20","baseline_50","baseline_100","baseline_150","baseline_200",
-    #         "three_phase_baseline_20","three_phase_baseline_50",
-    #         "three_phase_baseline_100","three_phase_baseline_150",
-    #         "three_phase_baseline_200",
-    #         "plasticity_500_5e-06","plasticity_500_1e-06","plasticity_500_5e-07","plasticity_500_5e-08","plasticity_500_0",
-    #         # "static_replay_500_5e-06","static_replay_500_1e-06","static_replay_500_5e-07","static_replay_500_5e-08","static_replay_500_0",
-    #         # "plasticity_three_phase_500_5e-06","plasticity_three_phase_500_1e-06","plasticity_three_phase_500_5e-07","plasticity_three_phase_500_5e-08","plasticity_three_phase_500_0",
-    #         # "plasticity_400_5e-06_prune_only","plasticity_400_1e-06_prune_only","plasticity_400_5e-07_prune_only","plasticity_400_1e-07_prune_only","plasticity_400_5e-08_prune_only","plasticity_400_5e-09_prune_only",
-    #         # "plasticity_three_phase_400_5e-06","plasticity_three_phase_400_1e-06","plasticity_three_phase_400_5e-07", "plasticity_three_phase_400_1e-07","plasticity_three_phase_400_5e-08",
-    #         # "plasticity_three_phase_400_5e-09"
-    #     ],
-    #     num_runs=5,
-    #     aggregate_runs=True,
-    #     show_pareto_frontier=True,
-    #     pareto_scope="per_kind",
-    #     pareto_frontier_kinds=("baseline", "three_phase", "plasticity", "plasticity_three_phase","static_replay"),
-    #     save_path_out="results_FashionMnist_FNN.png",
-    #     title="Test Acc vs Parameter Count",
-    #     y_col="Test Acc",
-    #     ylabel="Test Acc",
-    # )
+    plot_param_count_vs_test_acc(
+        save_path="results_FashionMnist_FNN_grow1_ws32_lr0.002_grownew8",
+        experiments=[
+           "baseline_20","baseline_50","baseline_100","baseline_150","baseline_200",
+            # "three_phase_baseline_20","three_phase_baseline_50","three_phase_baseline_100","three_phase_baseline_150","three_phase_baseline_200",
+            "plasticity_500_5e-06","plasticity_500_1e-06","plasticity_500_5e-07","plasticity_500_1e-07","plasticity_500_0",
+            # "plasticity_500_5e-06_prune_only","plasticity_500_1e-06_prune_only","plasticity_500_5e-07_prune_only","plasticity_500_1e-07_prune_only","plasticity_500_0_prune_only",
+            # "static_replay_500_5e-06","static_replay_500_1e-06","static_replay_500_5e-07","static_replay_500_5e-08","static_replay_500_0",
+            "nest_300_100_p0.1_refacc89_flooracc87",
+            "nest_300_100_p0.1_refacc89_flooracc87.5",
+            "nest_300_100_p0.1_refacc89_flooracc88",
+            "nest_300_100_p0.1_refacc89_flooracc88.5",
+            "nest_300_100_p0.1_refacc89_flooracc89",
+        ],
+        num_runs=5,
+        aggregate_runs=True,
+        show_pareto_frontier=True,
+        pareto_scope="per_junctures_mode",
+        pareto_frontier_kinds=("baseline", "three_phase", "plasticity", "plasticity_three_phase","static_replay", "nest"),
+        save_path_out="results_FashionMnist_FNN_acc.png",
+        title="Test Acc vs Parameter Count",
+        y_col="Test Acc",
+        ylabel="Test Acc",
+    )
+
+
+    plot_param_count_vs_test_acc(
+        save_path="results_FashionMnist_FNN_grow1_ws32_lr0.002_grownew8",
+        experiments=[
+           "baseline_20","baseline_50","baseline_100","baseline_150","baseline_200",
+            # "three_phase_baseline_20","three_phase_baseline_50","three_phase_baseline_100","three_phase_baseline_150","three_phase_baseline_200",
+            "plasticity_500_5e-06","plasticity_500_1e-06","plasticity_500_5e-07","plasticity_500_1e-07","plasticity_500_0",
+            # "plasticity_500_5e-06_prune_only","plasticity_500_1e-06_prune_only","plasticity_500_5e-07_prune_only","plasticity_500_1e-07_prune_only","plasticity_500_0_prune_only",
+            # "static_replay_500_5e-06","static_replay_500_1e-06","static_replay_500_5e-07","static_replay_500_5e-08","static_replay_500_0",
+            "nest_300_100_p0.1_refacc89_flooracc87",
+            "nest_300_100_p0.1_refacc89_flooracc87.5",
+            "nest_300_100_p0.1_refacc89_flooracc88",
+            "nest_300_100_p0.1_refacc89_flooracc88.5",
+            "nest_300_100_p0.1_refacc89_flooracc89",
+        ],
+        num_runs=5,
+        aggregate_runs=True,
+        show_pareto_frontier=True,
+        pareto_scope="per_junctures_mode",
+        pareto_frontier_kinds=("baseline", "three_phase", "plasticity", "plasticity_three_phase","static_replay", "nest"),
+        save_path_out="results_FashionMnist_FNN_brier.png",
+        title="Test Brier vs Parameter Count",
+        y_col="Test Brier",
+        ylabel="Test Brier",
+    )
 
     # plot_param_count_vs_test_acc(
     #     save_path="results_FashionMnist_FNN3",

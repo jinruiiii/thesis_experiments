@@ -35,7 +35,7 @@ import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 
-from main2 import (
+from main_plasticity import (
     SEED,
     BayesianFNN,
     _checkpoint_metric_label,
@@ -43,8 +43,10 @@ from main2 import (
     _format_lambda_dir,
     _is_better_checkpoint_score,
     _normalize_checkpoint_metric,
+    _parse_experiment_dir_name,
     _parse_hidden_sizes_from_summary,
     _resolve_plasticity_dir_for_static_replay,
+    _static_replay_output_dir,
     _val_score_for_checkpoint,
     count_params,
     device,
@@ -65,8 +67,8 @@ INPUT_DIM = 784
 NUM_CLASSES = 10
 DATASET_ROOT = "../../Datasets"
 
-GROUP_A = (0, 2, 3, 4, 6)  # T-shirt, Pullover, Dress, Coat, Shirt
-GROUP_B = (1, 5, 7, 8, 9)  # Trouser, Sandal, Sneaker, Bag, Ankle boot
+GROUP_B = (0, 2, 3, 4, 6)  # T-shirt, Pullover, Dress, Coat, Shirt
+GROUP_A = (1, 5, 7, 8, 9)  # Trouser, Sandal, Sneaker, Bag, Ankle boot
 CLASS_NAMES = (
     "T-shirt/top",
     "Trouser",
@@ -618,6 +620,7 @@ def run_prior_shift_experiment(
     initial_hidden_sizes=None,
     phase2_regrow_to_init=False,
     phase2_vcl_prior=False,
+    summary_lambda_penalty=None,
 ):
     """
     Two-phase Fashion-MNIST prior-shift run.
@@ -633,10 +636,20 @@ def run_prior_shift_experiment(
     Final evaluation uses the best Phase-2 validation checkpoint on balanced and
     Phase-2-matched tests, and scores the Phase-1-matched test on both best Phase-1
     and best Phase-2 checkpoints to measure forgetting.
+    summary_lambda_penalty:
+      Optional value written to experiment_summary.csv as Lambda Penalty while
+      training still uses lambda_penalty (e.g. static_replay trains at 0 but
+      reports the source plasticity lambda for Pareto coloring).
     """
     if output_dir is None:
         output_dir = os.path.join("./results", experiment_name)
     ensure_output_dir(output_dir)
+
+    csv_lambda_penalty = (
+        float(summary_lambda_penalty)
+        if summary_lambda_penalty is not None
+        else float(lambda_penalty)
+    )
 
     if shift_manifest is not None:
         write_shift_manifest(output_dir, shift_manifest)
@@ -1169,7 +1182,7 @@ def run_prior_shift_experiment(
         phase1_matched_at_p2_group_b_brier=p1_matched_at_p2_groups["brier_group_b"],
         phase1_matched_forget_acc=p1_matched_forget_acc,
         phase1_matched_forget_group_a_acc=p1_matched_forget_group_a_acc,
-        lambda_penalty=lambda_penalty,
+        lambda_penalty=csv_lambda_penalty,
         phase1_epochs=phase1_epochs,
         phase2_epochs=phase2_epochs,
         junctures_mode=junctures_mode,
@@ -1263,10 +1276,10 @@ def main(
     batch_size=256,
     learning_rate=0.005,
     beta=0.002,
-    gamma=0.1,
+    gamma=0.0,
     rho=0.1,
-    warm_start_steps=80,
-    warm_start_lr=0.001,
+    warm_start_steps=32,
+    warm_start_lr=0.002,
     decision_interval_min=1,
     decision_interval_max=1,
     decision_interval_power=1.0,
@@ -1293,8 +1306,9 @@ def main(
       If True (plasticity only), after Phase-1 rewind expand every hidden layer
       back to the original init hidden_sizes before Phase-2 training.
     phase2_vcl_prior:
-      If True (plasticity or baseline), after Phase-1 rewind freeze the Phase-1
-      posterior as the KL prior for Phase 2 (VCL-style). Applied before regrow.
+      If True (plasticity, baseline, or static_replay), after Phase-1 rewind
+      freeze the Phase-1 posterior as the KL prior for Phase 2 (VCL-style).
+      Applied before regrow.
     phase2_juncture_warmup_epochs:
       Number of Phase-2 epochs with weight-only training (no grow/prune) after
       the switch. Phase-1 junctures are unaffected. Example: phase1_epochs=30
@@ -1333,8 +1347,12 @@ def main(
     initial_hidden_sizes = list(hidden_sizes)
     # Only meaningful for plasticity; ignore for baseline / static_replay.
     use_phase2_regrow = bool(phase2_regrow_to_init) and run_mode == "plasticity"
-    # VCL prior applies to plasticity and baseline (fair stability control).
-    use_phase2_vcl = bool(phase2_vcl_prior) and run_mode in ("plasticity", "baseline")
+    # VCL prior applies to plasticity, baseline, and static_replay (fair control).
+    use_phase2_vcl = bool(phase2_vcl_prior) and run_mode in (
+        "plasticity",
+        "baseline",
+        "static_replay",
+    )
     vcl_tag = "_vcl" if use_phase2_vcl else ""
 
     if run_mode == "baseline":
@@ -1342,6 +1360,7 @@ def main(
         enable_structural = False
         experiment_name = "shift_baseline"
         run_name = f"baseline_{hidden_sizes[0]}{vcl_tag}"
+        output_dir = os.path.join(save_path, run_name)
     elif run_mode == "static_replay":
         if resume_from_plasticity_dir is None:
             raise ValueError("run_mode='static_replay' requires resume_from_plasticity_dir")
@@ -1349,11 +1368,21 @@ def main(
             resume_from_plasticity_dir
         )
         model_hidden = _parse_hidden_sizes_from_summary(summary_path)
+        source_meta = _parse_experiment_dir_name(os.path.basename(plasticity_dir))
+        source_lambda = source_meta.get("lambda_penalty")
+        if source_lambda is None:
+            source_lambda = float(lambda_penalty)
+        summary_lambda = float(source_lambda)
         lambda_penalty = 0.0
         enable_structural = False
         experiment_name = "shift_static_replay"
-        run_name = f"static_replay_{model_hidden[0]}"
+        # Place beside source plasticity_* (mirrors main2 naming).
+        output_dir = _static_replay_output_dir(plasticity_dir)
+        if use_phase2_vcl and not os.path.basename(output_dir).endswith("_vcl"):
+            output_dir = output_dir + "_vcl"
         print(f"Static replay widths from {plasticity_dir}: {model_hidden}")
+        print(f"Static replay output dir: {output_dir}")
+        print(f"Source lambda (summary): {summary_lambda}")
     else:
         experiment_name = "shift_plasticity"
         suffix = _experiment_dir_suffix(junctures_mode)
@@ -1363,8 +1392,8 @@ def main(
             f"plasticity_{hidden_sizes[0]}_{_format_lambda_dir(lambda_penalty)}"
             f"{suffix}{regrow_tag}{p2junct_tag}{vcl_tag}"
         )
+        output_dir = os.path.join(save_path, run_name)
 
-    output_dir = os.path.join(save_path, run_name)
     ensure_output_dir(output_dir)
 
     if run_mode == "static_replay":
@@ -1377,6 +1406,7 @@ def main(
                 "source_lambda_penalty": summary_lambda,
                 "training_lambda_penalty": 0.0,
                 "protocol": "fashion_mnist_prior_shift",
+                "phase2_vcl_prior": use_phase2_vcl,
             },
         )
 
@@ -1417,14 +1447,33 @@ def main(
         initial_hidden_sizes=initial_hidden_sizes,
         phase2_regrow_to_init=use_phase2_regrow,
         phase2_vcl_prior=use_phase2_vcl,
+        summary_lambda_penalty=summary_lambda if run_mode == "static_replay" else None,
     )
 
 
 if __name__ == "__main__":
     # Example: same-start static baseline + one plasticity lambda.
     # Uncomment to run. Prefer conservative phase1_epochs and inspect Phase-1 val curves.
-    phase1_epochs = 30
-    phase2_epochs = 30
+    # phase1_epochs = 30
+    # phase2_epochs = 30
+
+    # hidden_sizes = [500, 500]
+    # for lambda_penalty in [5e-08]:
+    #     for i in range(1, 6):
+    #         set_seed(SEED+i)
+    #         main(
+    #             f"results_prior_shift_FashionMnist_FNN_reverse_new/run_{i}",
+    #             hidden_sizes,
+    #             lambda_penalty=lambda_penalty,
+    #             run_mode="plasticity",
+    #             phase2_only_junctures=False,
+    #             phase2_regrow_to_init=False,
+    #             phase2_vcl_prior=True,
+    #             phase2_juncture_warmup_epochs=0,
+    #             phase1_epochs=phase1_epochs,
+    #             phase2_epochs=phase2_epochs,
+    #         )
+
 
     # hidden_sizes = [400,400]
     # # for r in [0.05,0.125,0.25,0.375,0.5]:
@@ -1441,56 +1490,6 @@ if __name__ == "__main__":
     #             phase2_epochs=phase2_epochs,
     #         )
 
-    # hidden_sizes = [500, 500]
-    # for lambda_penalty in [0, 5e-08, 5e-07, 1e-06, 5e-06]:
-    #     for i in range(1, 6):
-    #         set_seed(SEED+i)
-    #         main(
-    #             f"results_prior_shift_FashionMnist_FNN3/run_{i}",
-    #             hidden_sizes,
-    #             lambda_penalty=lambda_penalty,
-    #             run_mode="plasticity",
-    #             phase2_regrow_to_init=False,
-    #             phase2_vcl_prior=True,
-    #             phase2_juncture_warmup_epochs=0,
-    #             phase1_epochs=phase1_epochs,
-    #             phase2_epochs=phase2_epochs,
-    #         )
-
-    # hidden_sizes = [500, 500]
-    # for lambda_penalty in [0, 5e-08, 5e-07, 1e-06, 5e-06]:
-    #     for i in range(1, 6):
-    #         set_seed(SEED+i)
-    #         main(
-    #             f"results_prior_shift_FashionMnist_FNN1/run_{i}",
-    #             hidden_sizes,
-    #             lambda_penalty=lambda_penalty,
-    #             run_mode="plasticity",
-    #             phase2_only_junctures=True,
-    #             phase2_regrow_to_init=False,
-    #             phase2_vcl_prior=True,
-    #             phase2_juncture_warmup_epochs=0,
-    #             phase1_epochs=phase1_epochs,
-    #             phase2_epochs=phase2_epochs,
-    #         )
-
-
-    # hidden_sizes = [500, 500]
-    # for lambda_penalty in [0, 5e-08]:
-    #     for i in range(1, 6):
-    #         set_seed(SEED+i)
-    #         main(
-    #             f"results_prior_shift_FashionMnist_FNN1/run_{i}",
-    #             hidden_sizes,
-    #             lambda_penalty=lambda_penalty,
-    #             run_mode="plasticity",
-    #             phase2_only_junctures=False,
-    #             phase2_regrow_to_init=False,
-    #             phase2_vcl_prior=True,
-    #             phase2_juncture_warmup_epochs=0,
-    #             phase1_epochs=phase1_epochs,
-    #             phase2_epochs=phase2_epochs,
-    #         )
 
     # hidden_sizes = [500, 500]
     # for lambda_penalty in [0, 5e-08, 5e-07, 1e-06, 5e-06]:
@@ -1508,27 +1507,104 @@ if __name__ == "__main__":
     #             phase2_epochs=phase2_epochs,
     #         )
 
-    # Optional same-end control after a plasticity run:
-    # set_seed(SEED)
-    # main(
-    #     "results_prior_shift/run_1",
-    #     hidden_sizes,
-    #     run_mode="static_replay",
-    #     resume_from_plasticity_dir="results_prior_shift/run_1/plasticity_400_1e-06",
-    #     phase1_epochs=phase1_epochs,
-    #     phase2_epochs=phase2_epochs,
-    # )
+    # Same-end static_replay control after plasticity_*_vcl runs (mirrors main2 naming):
+    # writes static_replay_500_<lambda>_vcl beside each source plasticity folder.
+    # hidden_sizes = [500, 500]  # API-only; widths come from plasticity summary
+    # for lambda_penalty in [0, 5e-08, 1e-07, 5e-07, 1e-06, 5e-06]:
+    #     for i in range(1, 6):
+    #         set_seed(SEED + i)
+    #         lam_tag = _format_lambda_dir(lambda_penalty)
+    #         main(
+    #             f"results_prior_shift_FashionMnist_FNN_reverse_new/run_{i}",
+    #             hidden_sizes,
+    #             run_mode="static_replay",
+    #             resume_from_plasticity_dir=(
+    #                 f"results_prior_shift_FashionMnist_FNN_reverse_new/run_{i}/"
+    #                 f"plasticity_500_{lam_tag}_vcl"
+    #             ),
+    #             phase2_vcl_prior=True,
+    #             phase1_epochs=phase1_epochs,
+    #             phase2_epochs=phase2_epochs,
+    #         )
 
-    # print(
-    #     "main4.py ready. Uncomment the __main__ examples to run "
-    #     "baseline / plasticity / static_replay prior-shift experiments."
-    # )
-
+    plot_param_count_vs_test_acc(
+        save_path="results_prior_shift_FashionMnist_FNN",
+        experiments=[
+            "baseline_20_vcl","baseline_50_vcl", "baseline_100_vcl", "baseline_150_vcl", "baseline_200_vcl",
+            "plasticity_500_0_vcl","plasticity_500_5e-08_vcl","plasticity_500_1e-07_vcl", "plasticity_500_5e-07_vcl", "plasticity_500_1e-06_vcl", "plasticity_500_5e-06_vcl",
+            # "static_replay_500_0_vcl","static_replay_500_5e-08_vcl", "static_replay_500_1e-07_vcl","static_replay_500_5e-07_vcl", "static_replay_500_1e-06_vcl", "static_replay_500_5e-06_vcl",
+            # "plasticity_500_0_regrow_vcl","plasticity_500_5e-08_regrow_vcl", "plasticity_500_5e-07_regrow_vcl", "plasticity_500_1e-06_regrow_vcl", "plasticity_500_5e-06_regrow_vcl",
+            # "plasticity_500_0_p2junct_vcl","plasticity_500_5e-08_p2junct_vcl", "plasticity_500_5e-07_p2junct_vcl", "plasticity_500_1e-06_p2junct_vcl", "plasticity_500_5e-06_p2junct_vcl",
+        ],
+        num_runs=5,
+        aggregate_runs=True,
+        show_pareto_frontier=True,
+        pareto_scope="per_kind",
+        pareto_frontier_kinds=("baseline", "plasticity", "static_replay"),
+        y_col="Test Acc",  # or "Test Group B Acc" / "Test Group A Acc"
+        title="Test Acc (Balanced) vs Parameter Count",
+        save_path_out="results_prior_shift_FashionMnist_FNN/balanced_test_acc_vcl.png",
+    )
+    plot_param_count_vs_test_acc(
+        save_path="results_prior_shift_FashionMnist_FNN",
+        experiments=[
+            "baseline_20_vcl","baseline_50_vcl", "baseline_100_vcl", "baseline_150_vcl", "baseline_200_vcl",
+            "plasticity_500_0_vcl","plasticity_500_5e-08_vcl","plasticity_500_1e-07_vcl", "plasticity_500_5e-07_vcl", "plasticity_500_1e-06_vcl", "plasticity_500_5e-06_vcl",
+            # "static_replay_500_0_vcl","static_replay_500_5e-08_vcl", "static_replay_500_1e-07_vcl","static_replay_500_5e-07_vcl", "static_replay_500_1e-06_vcl", "static_replay_500_5e-06_vcl",
+            # "plasticity_500_0_regrow_vcl","plasticity_500_5e-08_regrow_vcl", "plasticity_500_5e-07_regrow_vcl", "plasticity_500_1e-06_regrow_vcl", "plasticity_500_5e-06_regrow_vcl",
+            # "plasticity_500_0_p2junct_vcl","plasticity_500_5e-08_p2junct_vcl", "plasticity_500_5e-07_p2junct_vcl", "plasticity_500_1e-06_p2junct_vcl", "plasticity_500_5e-06_p2junct_vcl",
+        ],
+        num_runs=5,
+        aggregate_runs=True,
+        show_pareto_frontier=True,
+        pareto_scope="per_kind",
+        pareto_frontier_kinds=("baseline", "plasticity", "static_replay"),
+        y_col="Test Brier",  # or "Test Group B Acc" / "Test Group A Acc"
+        title="Test Brier (Balanced)vs Parameter Count",
+        save_path_out="results_prior_shift_FashionMnist_FNN/balanced_test_brier_vcl.png",
+    )
+    plot_param_count_vs_test_acc(
+        save_path="results_prior_shift_FashionMnist_FNN",
+        experiments=[
+            "baseline_20_vcl","baseline_50_vcl", "baseline_100_vcl", "baseline_150_vcl", "baseline_200_vcl",
+            "plasticity_500_0_vcl","plasticity_500_5e-08_vcl", "plasticity_500_5e-07_vcl", "plasticity_500_1e-06_vcl", "plasticity_500_5e-06_vcl",
+            # "static_replay_500_0_vcl","static_replay_500_5e-08_vcl", "static_replay_500_5e-07_vcl", "static_replay_500_1e-06_vcl", "static_replay_500_5e-06_vcl",
+            # "plasticity_500_0_regrow_vcl","plasticity_500_5e-08_regrow_vcl", "plasticity_500_5e-07_regrow_vcl", "plasticity_500_1e-06_regrow_vcl", "plasticity_500_5e-06_regrow_vcl",
+            # "plasticity_500_0_p2junct_vcl","plasticity_500_5e-08_p2junct_vcl", "plasticity_500_5e-07_p2junct_vcl", "plasticity_500_1e-06_p2junct_vcl", "plasticity_500_5e-06_p2junct_vcl",
+        ],
+        num_runs=5,
+        aggregate_runs=True,
+        show_pareto_frontier=True,
+        pareto_scope="per_kind",
+        pareto_frontier_kinds=("baseline", "plasticity", "static_replay"),
+        y_col="Phase2 Matched Test Acc",  # or "Test Group B Acc" / "Test Group A Acc"
+        title="Test Acc (Phase2 Prior)vs Parameter Count",
+        save_path_out="results_prior_shift_FashionMnist_FNN/phase2_matched_test_acc_vcl.png",
+    )
+    plot_param_count_vs_test_acc(
+        save_path="results_prior_shift_FashionMnist_FNN",
+        experiments=[
+            "baseline_20_vcl","baseline_50_vcl", "baseline_100_vcl", "baseline_150_vcl", "baseline_200_vcl",
+            "plasticity_500_0_vcl","plasticity_500_5e-08_vcl", "plasticity_500_5e-07_vcl", "plasticity_500_1e-06_vcl", "plasticity_500_5e-06_vcl",
+            # "static_replay_500_0_vcl","static_replay_500_5e-08_vcl", "static_replay_500_5e-07_vcl", "static_replay_500_1e-06_vcl", "static_replay_500_5e-06_vcl",
+            # "plasticity_500_0_regrow_vcl","plasticity_500_5e-08_regrow_vcl", "plasticity_500_5e-07_regrow_vcl", "plasticity_500_1e-06_regrow_vcl", "plasticity_500_5e-06_regrow_vcl",
+            # "plasticity_500_0_p2junct_vcl","plasticity_500_5e-08_p2junct_vcl", "plasticity_500_5e-07_p2junct_vcl", "plasticity_500_1e-06_p2junct_vcl", "plasticity_500_5e-06_p2junct_vcl",
+        ],
+        num_runs=5,
+        aggregate_runs=True,
+        show_pareto_frontier=True,
+        pareto_scope="per_kind",
+        pareto_frontier_kinds=("baseline", "plasticity", "static_replay"),
+        y_col="Phase2 Matched Test Brier",  # or "Test Group B Acc" / "Test Group A Acc"
+        title="Test Brier (Phase 2 Prior) vs Parameter Count",
+        save_path_out="results_prior_shift_FashionMnist_FNN/phase2_matched_test_brier_vcl.png",
+    )
     # plot_param_count_vs_test_acc(
-    #     save_path="results_prior_shift_FashionMnist_FNN_forward",
+    #     save_path="results_prior_shift_FashionMnist_FNN_reverse",
     #     experiments=[
     #         "baseline_20_vcl","baseline_50_vcl", "baseline_100_vcl", "baseline_150_vcl", "baseline_200_vcl",
     #         "plasticity_500_0_vcl","plasticity_500_5e-08_vcl", "plasticity_500_5e-07_vcl", "plasticity_500_1e-06_vcl", "plasticity_500_5e-06_vcl",
+    #         "static_replay_500_0_vcl","static_replay_500_5e-08_vcl", "static_replay_500_5e-07_vcl", "static_replay_500_1e-06_vcl", "static_replay_500_5e-06_vcl",
     #         # "plasticity_500_0_regrow_vcl","plasticity_500_5e-08_regrow_vcl", "plasticity_500_5e-07_regrow_vcl", "plasticity_500_1e-06_regrow_vcl", "plasticity_500_5e-06_regrow_vcl",
     #         # "plasticity_500_0_p2junct_vcl","plasticity_500_5e-08_p2junct_vcl", "plasticity_500_5e-07_p2junct_vcl", "plasticity_500_1e-06_p2junct_vcl", "plasticity_500_5e-06_p2junct_vcl",
     #     ],
@@ -1536,94 +1612,9 @@ if __name__ == "__main__":
     #     aggregate_runs=True,
     #     show_pareto_frontier=True,
     #     pareto_scope="per_kind",
-    #     pareto_frontier_kinds=("baseline", "plasticity"),
-    #     y_col="Test Acc",  # or "Test Group B Acc" / "Test Group A Acc"
-    #     title="Test Acc (Balanced) vs Parameter Count",
-    #     save_path_out="results_prior_shift_FashionMnist_FNN_forward/balanced_test_acc_vcl.png",
-    # )
-    # plot_param_count_vs_test_acc(
-    #     save_path="results_prior_shift_FashionMnist_FNN_forward",
-    #     experiments=[
-    #         "baseline_20_vcl","baseline_50_vcl", "baseline_100_vcl", "baseline_150_vcl", "baseline_200_vcl",
-    #         "plasticity_500_0_vcl","plasticity_500_5e-08_vcl", "plasticity_500_5e-07_vcl", "plasticity_500_1e-06_vcl", "plasticity_500_5e-06_vcl",
-    #         # "plasticity_500_0_regrow_vcl","plasticity_500_5e-08_regrow_vcl", "plasticity_500_5e-07_regrow_vcl", "plasticity_500_1e-06_regrow_vcl", "plasticity_500_5e-06_regrow_vcl",
-    #         # "plasticity_500_0_p2junct_vcl","plasticity_500_5e-08_p2junct_vcl", "plasticity_500_5e-07_p2junct_vcl", "plasticity_500_1e-06_p2junct_vcl", "plasticity_500_5e-06_p2junct_vcl",
-    #     ],
-    #     num_runs=5,
-    #     aggregate_runs=True,
-    #     show_pareto_frontier=True,
-    #     pareto_scope="per_kind",
-    #     pareto_frontier_kinds=("baseline", "plasticity"),
-    #     y_col="Test Brier",  # or "Test Group B Acc" / "Test Group A Acc"
-    #     title="Test Brier (Balanced)vs Parameter Count",
-    #     save_path_out="results_prior_shift_FashionMnist_FNN_forward/balanced_test_brier_vcl.png",
-    # )
-    # plot_param_count_vs_test_acc(
-    #     save_path="results_prior_shift_FashionMnist_FNN_forward",
-    #     experiments=[
-    #         "baseline_20_vcl","baseline_50_vcl", "baseline_100_vcl", "baseline_150_vcl", "baseline_200_vcl",
-    #         "plasticity_500_0_vcl","plasticity_500_5e-08_vcl", "plasticity_500_5e-07_vcl", "plasticity_500_1e-06_vcl", "plasticity_500_5e-06_vcl",
-    #         # "plasticity_500_0_regrow_vcl","plasticity_500_5e-08_regrow_vcl", "plasticity_500_5e-07_regrow_vcl", "plasticity_500_1e-06_regrow_vcl", "plasticity_500_5e-06_regrow_vcl",
-    #         # "plasticity_500_0_p2junct_vcl","plasticity_500_5e-08_p2junct_vcl", "plasticity_500_5e-07_p2junct_vcl", "plasticity_500_1e-06_p2junct_vcl", "plasticity_500_5e-06_p2junct_vcl",
-    #     ],
-    #     num_runs=5,
-    #     aggregate_runs=True,
-    #     show_pareto_frontier=True,
-    #     pareto_scope="per_kind",
-    #     pareto_frontier_kinds=("baseline", "plasticity"),
-    #     y_col="Phase2 Matched Test Acc",  # or "Test Group B Acc" / "Test Group A Acc"
-    #     title="Test Acc (Phase2 Prior)vs Parameter Count",
-    #     save_path_out="results_prior_shift_FashionMnist_FNN_forward/phase2_matched_test_acc_vcl.png",
-    # )
-    # plot_param_count_vs_test_acc(
-    #     save_path="results_prior_shift_FashionMnist_FNN_forward",
-    #     experiments=[
-    #         "baseline_20_vcl","baseline_50_vcl", "baseline_100_vcl", "baseline_150_vcl", "baseline_200_vcl",
-    #         "plasticity_500_0_vcl","plasticity_500_5e-08_vcl", "plasticity_500_5e-07_vcl", "plasticity_500_1e-06_vcl", "plasticity_500_5e-06_vcl",
-    #         # "plasticity_500_0_regrow_vcl","plasticity_500_5e-08_regrow_vcl", "plasticity_500_5e-07_regrow_vcl", "plasticity_500_1e-06_regrow_vcl", "plasticity_500_5e-06_regrow_vcl",
-    #         # "plasticity_500_0_p2junct_vcl","plasticity_500_5e-08_p2junct_vcl", "plasticity_500_5e-07_p2junct_vcl", "plasticity_500_1e-06_p2junct_vcl", "plasticity_500_5e-06_p2junct_vcl",
-    #     ],
-    #     num_runs=5,
-    #     aggregate_runs=True,
-    #     show_pareto_frontier=True,
-    #     pareto_scope="per_kind",
-    #     pareto_frontier_kinds=("baseline", "plasticity"),
-    #     y_col="Phase2 Matched Test Brier",  # or "Test Group B Acc" / "Test Group A Acc"
-    #     title="Test Brier (Phase 2 Prior) vs Parameter Count",
-    #     save_path_out="results_prior_shift_FashionMnist_FNN_forward/phase2_matched_test_brier_vcl.png",
-    # )
-    # plot_param_count_vs_test_acc(
-    #     save_path="results_prior_shift_FashionMnist_FNN_forward",
-    #     experiments=[
-    #         "baseline_20_vcl","baseline_50_vcl", "baseline_100_vcl", "baseline_150_vcl", "baseline_200_vcl",
-    #         "plasticity_500_0_vcl","plasticity_500_5e-08_vcl", "plasticity_500_5e-07_vcl", "plasticity_500_1e-06_vcl", "plasticity_500_5e-06_vcl",
-    #         # "plasticity_500_0_regrow_vcl","plasticity_500_5e-08_regrow_vcl", "plasticity_500_5e-07_regrow_vcl", "plasticity_500_1e-06_regrow_vcl", "plasticity_500_5e-06_regrow_vcl",
-    #         # "plasticity_500_0_p2junct_vcl","plasticity_500_5e-08_p2junct_vcl", "plasticity_500_5e-07_p2junct_vcl", "plasticity_500_1e-06_p2junct_vcl", "plasticity_500_5e-06_p2junct_vcl",
-    #     ],
-    #     num_runs=5,
-    #     aggregate_runs=True,
-    #     show_pareto_frontier=True,
-    #     pareto_scope="per_kind",
-    #     pareto_frontier_kinds=("baseline", "plasticity"),
+    #     pareto_frontier_kinds=("baseline", "plasticity", "static_replay"),
     #     y_col="Phase1 Matched Forget Acc",  # or "Test Group B Acc" / "Test Group A Acc"
     #     title="Test Acc vs Parameter Count",
-    #     save_path_out="results_prior_shift_FashionMnist_FNN_forward/phase1_matched_forget_test_acc_vcl.png",
-    # )
-    # plot_param_count_vs_test_acc(
-    #     save_path="results_prior_shift_FashionMnist_FNN_forward",
-    #     experiments=[
-    #         "baseline_50_vcl", "baseline_100_vcl", "baseline_150_vcl", "baseline_200_vcl",
-    #         "plasticity_500_0_vcl","plasticity_500_5e-08_vcl", "plasticity_500_5e-07_vcl", "plasticity_500_1e-06_vcl", "plasticity_500_5e-06_vcl",
-    #         # "plasticity_500_0_regrow_vcl","plasticity_500_5e-08_regrow_vcl", "plasticity_500_5e-07_regrow_vcl", "plasticity_500_1e-06_regrow_vcl", "plasticity_500_5e-06_regrow_vcl",
-    #         # "plasticity_500_0_p2junct_vcl","plasticity_500_5e-08_p2junct_vcl", "plasticity_500_5e-07_p2junct_vcl", "plasticity_500_1e-06_p2junct_vcl", "plasticity_500_5e-06_p2junct_vcl",
-    #     ],
-    #     num_runs=5,
-    #     aggregate_runs=True,
-    #     show_pareto_frontier=True,
-    #     pareto_scope="per_kind",
-    #     pareto_frontier_kinds=("baseline", "plasticity"),
-    #     y_col="Phase1 Matched Forget Brier",  # or "Test Group B Acc" / "Test Group A Acc"
-    #     title="Test Brier vs Parameter Count",
-    #     save_path_out="results_prior_shift_FashionMnist_FNN_forward/phase1_matched_forget_test_brier_vcl.png",
+    #     save_path_out="results_prior_shift_FashionMnist_FNN_reverse/phase1_matched_forget_test_acc_vcl.png",
     # )
 
