@@ -3452,8 +3452,10 @@ def _parse_experiment_dir_name(dirname):
       static_replay_400_1e-06
       static_replay_400_1e-06_prune_only
       nest_300_100_p0.1_refacc89_flooracc89
+      dropnet_300_100_p0.2_modeglobal_kappa0.99
     Returns dict with keys: kind, init_width, lambda_penalty, junctures_mode, label, dir_tags
-    (plus nest_p / nest_ref_acc / nest_floor_acc for Nest folders).
+    (plus nest_p / nest_ref_acc / nest_floor_acc for Nest folders,
+     dropnet_p / dropnet_mode / dropnet_kappa for DropNet folders).
     """
     raw_name = str(dirname)
     name, dir_tags = _strip_optional_experiment_dir_tags(raw_name)
@@ -3648,6 +3650,29 @@ def _parse_experiment_dir_name(dirname):
             "nest_floor_acc": nest_floor_acc,
             "label": f"nest {w1}/{w2} p={nest_p:g} floor={nest_floor_acc:g}",
         })
+    m = re.match(
+        r"^dropnet_(\d+(?:_\d+)*)_p([0-9.e+-]+)_mode(global|layer)_kappa([0-9.e+-]+)$",
+        name,
+    )
+    if m:
+        widths = [int(w) for w in m.group(1).split("_")]
+        dropnet_p = float(m.group(2))
+        dropnet_mode = m.group(3)
+        dropnet_kappa = float(m.group(4))
+        width_label = "/".join(str(w) for w in widths)
+        return _with_tags({
+            "kind": "dropnet",
+            "init_width": widths[0],
+            "lambda_penalty": None,
+            "junctures_mode": "dropnet",
+            "dropnet_p": dropnet_p,
+            "dropnet_mode": dropnet_mode,
+            "dropnet_kappa": dropnet_kappa,
+            "label": (
+                f"dropnet {width_label} p={dropnet_p:g} "
+                f"{dropnet_mode} κ={dropnet_kappa:g}"
+            ),
+        })
     return _with_tags({
         "kind": "other",
         "init_width": None,
@@ -3714,8 +3739,10 @@ def collect_experiment_summaries(
             meta = _parse_experiment_dir_name(exp_dir.name)
             csv_junctures = row0.get("Junctures Mode")
             junctures_mode = meta.get("junctures_mode")
-            if csv_junctures is not None and not pd.isna(csv_junctures):
-                junctures_mode = str(csv_junctures)
+            # Keep DropNet kind/mode from the folder name; CSV stores dropnet_global/layer.
+            if meta.get("kind") != "dropnet":
+                if csv_junctures is not None and not pd.isna(csv_junctures):
+                    junctures_mode = str(csv_junctures)
             rows.append(
                 {
                     "run": run_id,
@@ -3727,6 +3754,9 @@ def collect_experiment_summaries(
                     "nest_p": meta.get("nest_p"),
                     "nest_ref_acc": meta.get("nest_ref_acc"),
                     "nest_floor_acc": meta.get("nest_floor_acc"),
+                    "dropnet_p": meta.get("dropnet_p"),
+                    "dropnet_mode": meta.get("dropnet_mode"),
+                    "dropnet_kappa": meta.get("dropnet_kappa"),
                     "model_label": str(row0.get("Model", meta["kind"])),
                     "x": float(row0[x_col]),
                     "y": float(row0[y_col]),
@@ -3764,6 +3794,16 @@ def _nest_floor_color_map(df, palette=None):
     return {floor: palette[i % len(palette)] for i, floor in enumerate(floors)}
 
 
+def _dropnet_kappa_color_map(df, palette=None):
+    """Distinct color per DropNet kappa value."""
+    kappas = sorted(
+        df.loc[df["kind"] == "dropnet", "dropnet_kappa"].dropna().unique()
+    )
+    if palette is None:
+        palette = list(plt.cm.Set3.colors) + list(plt.cm.Dark2.colors)
+    return {kappa: palette[i % len(palette)] for i, kappa in enumerate(kappas)}
+
+
 def _junctures_mode_marker(mode):
     if mode == "grow":
         return "^"
@@ -3780,7 +3820,15 @@ def _plasticity_point_color(row, style_map, lambda_colors):
     return style_map["plasticity"]["color"]
 
 
-def _point_style(row, style_map, lambda_colors, style_by_junctures=False, nest_floor_colors=None):
+def _point_style(
+    row,
+    style_map,
+    lambda_colors,
+    style_by_junctures=False,
+    nest_floor_colors=None,
+    dropnet_kappa_colors=None,
+    dropnet_style_by_mode=False,
+):
     kind = row["kind"]
     if kind == "baseline":
         color = style_map["baseline"]["color"]
@@ -3839,6 +3887,27 @@ def _point_style(row, style_map, lambda_colors, style_by_junctures=False, nest_f
             "facecolor": color,
             "edgecolor": "black",
             "linewidth": 0.4,
+        }
+    if kind == "dropnet":
+        style = style_map.get("dropnet", {"color": "#17becf", "marker": "^"})
+        kappa = row.get("dropnet_kappa")
+        if (
+            dropnet_kappa_colors is not None
+            and kappa is not None
+            and not pd.isna(kappa)
+            and kappa in dropnet_kappa_colors
+        ):
+            color = dropnet_kappa_colors[kappa]
+        else:
+            color = style["color"]
+        mode = row.get("dropnet_mode")
+        hollow = dropnet_style_by_mode and mode == "layer"
+        return {
+            "color": color,
+            "marker": style["marker"],
+            "facecolor": "white" if hollow else color,
+            "edgecolor": color if hollow else "black",
+            "linewidth": 1.0 if hollow else 0.4,
         }
     if kind == "plasticity":
         mode = row.get("junctures_mode")
@@ -4131,10 +4200,14 @@ def _legend_handles_for_test_acc_plot(
     lambda_colors,
     style_by_junctures=False,
     nest_floor_colors=None,
+    dropnet_kappa_colors=None,
+    dropnet_style_by_mode=False,
 ):
     handles = []
     if nest_floor_colors is None:
         nest_floor_colors = {}
+    if dropnet_kappa_colors is None:
+        dropnet_kappa_colors = {}
     if (df["kind"] == "baseline").any():
         handles.append(
             Line2D(
@@ -4259,6 +4332,46 @@ def _legend_handles_for_test_acc_plot(
                     markeredgewidth=0.4,
                     markersize=8,
                     label="nest",
+                )
+            )
+    dropnet_df = df.loc[df["kind"] == "dropnet"]
+    if not dropnet_df.empty:
+        dropnet_style = style_map.get("dropnet", {"color": "#17becf", "marker": "^"})
+        kappas = sorted(dropnet_df["dropnet_kappa"].dropna().unique())
+        modes = sorted(dropnet_df["dropnet_mode"].dropna().unique())
+        if kappas:
+            mode_iter = modes if dropnet_style_by_mode and modes else [None]
+            for kappa in kappas:
+                for mode in mode_iter:
+                    color = dropnet_kappa_colors.get(kappa, dropnet_style["color"])
+                    hollow = dropnet_style_by_mode and mode == "layer"
+                    if mode is None:
+                        label = f"dropnet κ={kappa:g}"
+                    else:
+                        label = f"dropnet {mode} κ={kappa:g}"
+                    handles.append(
+                        Line2D(
+                            [0], [0],
+                            marker=dropnet_style["marker"],
+                            color="w",
+                            markerfacecolor="white" if hollow else color,
+                            markeredgecolor=color if hollow else "black",
+                            markeredgewidth=1.0 if hollow else 0.4,
+                            markersize=8,
+                            label=label,
+                        )
+                    )
+        else:
+            handles.append(
+                Line2D(
+                    [0], [0],
+                    marker=dropnet_style["marker"],
+                    color="w",
+                    markerfacecolor=dropnet_style["color"],
+                    markeredgecolor="black",
+                    markeredgewidth=0.4,
+                    markersize=8,
+                    label="dropnet",
                 )
             )
     if (df["kind"] == "other").any():
@@ -4400,21 +4513,31 @@ def plot_param_count_vs_test_acc(
             "plasticity": {"color": "#d62728", "marker": "o"},
             "static_replay": {"color": "#2ca02c", "marker": "X"},
             "nest": {"color": "#ff7f0e", "marker": "v"},
+            "dropnet": {"color": "#17becf", "marker": "^"},
             "other": {"color": "gray", "marker": "x"},
         }
     lambda_colors = _lambda_penalty_color_map(df, palette=lambda_palette)
     nest_floor_colors = _nest_floor_color_map(df, palette=lambda_palette)
+    dropnet_kappa_colors = _dropnet_kappa_color_map(df, palette=lambda_palette)
     plasticity_modes = df.loc[df["kind"] == "plasticity", "junctures_mode"].dropna().unique()
     style_by_junctures = (
         style_by == "junctures_mode"
         and len(plasticity_modes) > 1
     )
+    dropnet_modes = df.loc[df["kind"] == "dropnet", "dropnet_mode"].dropna().unique()
+    dropnet_style_by_mode = len(dropnet_modes) > 1
     fig, ax = plt.subplots(figsize=figsize)
     grouped = None
     if not aggregate_runs:
         for _, row in df.iterrows():
             style = _point_style(
-                row, style_map, lambda_colors, style_by_junctures, nest_floor_colors
+                row,
+                style_map,
+                lambda_colors,
+                style_by_junctures,
+                nest_floor_colors,
+                dropnet_kappa_colors,
+                dropnet_style_by_mode,
             )
             _scatter_point(ax, row["x"], row["y"], style, marker_size)
     else:
@@ -4431,13 +4554,22 @@ def plot_param_count_vs_test_acc(
                 junctures_mode=("junctures_mode", "first"),
                 nest_floor_acc=("nest_floor_acc", "first"),
                 nest_p=("nest_p", "first"),
+                dropnet_kappa=("dropnet_kappa", "first"),
+                dropnet_mode=("dropnet_mode", "first"),
+                dropnet_p=("dropnet_p", "first"),
                 n_runs=("run", "nunique"),
             )
             .reset_index()
         )
         for _, row in grouped.iterrows():
             style = _point_style(
-                row, style_map, lambda_colors, style_by_junctures, nest_floor_colors
+                row,
+                style_map,
+                lambda_colors,
+                style_by_junctures,
+                nest_floor_colors,
+                dropnet_kappa_colors,
+                dropnet_style_by_mode,
             )
             ax.errorbar(
                 row["x_mean"], row["y_mean"],
@@ -4463,7 +4595,13 @@ def plot_param_count_vs_test_acc(
                 )
         for _, row in df.iterrows():
             style = _point_style(
-                row, style_map, lambda_colors, style_by_junctures, nest_floor_colors
+                row,
+                style_map,
+                lambda_colors,
+                style_by_junctures,
+                nest_floor_colors,
+                dropnet_kappa_colors,
+                dropnet_style_by_mode,
             )
             _scatter_point(
                 ax, row["x"], row["y"], style, marker_size * 0.5, alpha=alpha_individual
@@ -4494,6 +4632,7 @@ def plot_param_count_vs_test_acc(
             "plasticity": style_map["plasticity"]["color"],
             "static_replay": style_map.get("static_replay", {"color": "#2ca02c"})["color"],
             "nest": style_map.get("nest", {"color": "#ff7f0e"})["color"],
+            "dropnet": style_map.get("dropnet", {"color": "#17becf"})["color"],
             "other": style_map["other"]["color"],
         }
         if pareto_scope == "global":
@@ -4545,6 +4684,8 @@ def plot_param_count_vs_test_acc(
         lambda_colors,
         style_by_junctures,
         nest_floor_colors=nest_floor_colors,
+        dropnet_kappa_colors=dropnet_kappa_colors,
+        dropnet_style_by_mode=dropnet_style_by_mode,
     )
     handles.extend(pareto_handles)
     legend_title = "Model / λ / junctures" if style_by_junctures else "Model / λ / nest floor"
@@ -4646,7 +4787,7 @@ if __name__ == "__main__":
 
 
     # # Static replay: train a fixed FNN using Hidden Sizes from each plasticity run's summary.
-    # for lambda_penalty in [0,1e-07,5e-07,1e-06,5e-06]:
+    # for lambda_penalty in [1e-07,5e-07,1e-06,5e-06]:
     #     for i in range(1, 6):
     #         set_seed(SEED+i)
     #         plasticity_dir = (
@@ -4750,18 +4891,24 @@ if __name__ == "__main__":
             # "three_phase_baseline_20","three_phase_baseline_50","three_phase_baseline_100","three_phase_baseline_150","three_phase_baseline_200",
             "plasticity_500_5e-06","plasticity_500_1e-06","plasticity_500_5e-07","plasticity_500_1e-07","plasticity_500_0",
             # "plasticity_500_5e-06_prune_only","plasticity_500_1e-06_prune_only","plasticity_500_5e-07_prune_only","plasticity_500_1e-07_prune_only","plasticity_500_0_prune_only",
-            # "static_replay_500_5e-06","static_replay_500_1e-06","static_replay_500_5e-07","static_replay_500_5e-08","static_replay_500_0",
-            "nest_300_100_p0.1_refacc89_flooracc87",
-            "nest_300_100_p0.1_refacc89_flooracc87.5",
-            "nest_300_100_p0.1_refacc89_flooracc88",
-            "nest_300_100_p0.1_refacc89_flooracc88.5",
-            "nest_300_100_p0.1_refacc89_flooracc89",
+            "static_replay_500_5e-06","static_replay_500_1e-06","static_replay_500_5e-07","static_replay_500_1e-07","static_replay_500_0",
+            # "nest_300_100_p0.1_refacc89_flooracc87",
+            # "nest_300_100_p0.1_refacc89_flooracc87.5",
+            # "nest_300_100_p0.1_refacc89_flooracc88",
+            # "nest_300_100_p0.1_refacc89_flooracc88.5",
+            # "nest_300_100_p0.1_refacc89_flooracc89",
+            # "dropnet_300_100_p0.2_modeglobal_kappa1",
+            # "dropnet_300_100_p0.2_modeglobal_kappa0.998",
+            # "dropnet_300_100_p0.2_modeglobal_kappa0.996",
+            # "dropnet_300_100_p0.2_modeglobal_kappa0.994",
+            # "dropnet_300_100_p0.2_modeglobal_kappa0.992",
+            # "dropnet_300_100_p0.2_modeglobal_kappa0.99",
         ],
         num_runs=5,
         aggregate_runs=True,
         show_pareto_frontier=True,
         pareto_scope="per_junctures_mode",
-        pareto_frontier_kinds=("baseline", "three_phase", "plasticity", "plasticity_three_phase","static_replay", "nest"),
+        pareto_frontier_kinds=("baseline", "three_phase", "plasticity", "plasticity_three_phase","static_replay", "nest", "dropnet"),
         save_path_out="results_FashionMnist_FNN_acc.png",
         title="Test Acc vs Parameter Count",
         y_col="Test Acc",
@@ -4776,18 +4923,24 @@ if __name__ == "__main__":
             # "three_phase_baseline_20","three_phase_baseline_50","three_phase_baseline_100","three_phase_baseline_150","three_phase_baseline_200",
             "plasticity_500_5e-06","plasticity_500_1e-06","plasticity_500_5e-07","plasticity_500_1e-07","plasticity_500_0",
             # "plasticity_500_5e-06_prune_only","plasticity_500_1e-06_prune_only","plasticity_500_5e-07_prune_only","plasticity_500_1e-07_prune_only","plasticity_500_0_prune_only",
-            # "static_replay_500_5e-06","static_replay_500_1e-06","static_replay_500_5e-07","static_replay_500_5e-08","static_replay_500_0",
-            "nest_300_100_p0.1_refacc89_flooracc87",
-            "nest_300_100_p0.1_refacc89_flooracc87.5",
-            "nest_300_100_p0.1_refacc89_flooracc88",
-            "nest_300_100_p0.1_refacc89_flooracc88.5",
-            "nest_300_100_p0.1_refacc89_flooracc89",
+            "static_replay_500_5e-06","static_replay_500_1e-06","static_replay_500_5e-07","static_replay_500_1e-07","static_replay_500_0",
+            # "nest_300_100_p0.1_refacc89_flooracc87",
+            # "nest_300_100_p0.1_refacc89_flooracc87.5",
+            # "nest_300_100_p0.1_refacc89_flooracc88",
+            # "nest_300_100_p0.1_refacc89_flooracc88.5",
+            # "nest_300_100_p0.1_refacc89_flooracc89",
+            # "dropnet_300_100_p0.2_modeglobal_kappa1",
+            # "dropnet_300_100_p0.2_modeglobal_kappa0.998",
+            # "dropnet_300_100_p0.2_modeglobal_kappa0.996",
+            # "dropnet_300_100_p0.2_modeglobal_kappa0.994",
+            # "dropnet_300_100_p0.2_modeglobal_kappa0.992",
+            # "dropnet_300_100_p0.2_modeglobal_kappa0.99",
         ],
         num_runs=5,
         aggregate_runs=True,
         show_pareto_frontier=True,
         pareto_scope="per_junctures_mode",
-        pareto_frontier_kinds=("baseline", "three_phase", "plasticity", "plasticity_three_phase","static_replay", "nest"),
+        pareto_frontier_kinds=("baseline", "three_phase", "plasticity", "plasticity_three_phase","static_replay", "nest", "dropnet"),
         save_path_out="results_FashionMnist_FNN_brier.png",
         title="Test Brier vs Parameter Count",
         y_col="Test Brier",
