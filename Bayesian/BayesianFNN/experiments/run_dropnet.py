@@ -1,17 +1,5 @@
-"""
-Bayesian DropNet (Tan & Motani) on Fashion-MNIST.
-
-Dense Bayesian FNN with iterative structured neuron pruning:
-  - Start from a configurable dense seed (default [500, 500]).
-  - Each cycle: reset surviving neurons to θ₀, train with early stopping,
-    then drop the lowest mean-|post-activation| neurons (global or layer-wise).
-  - Stop when val_acc <= κ * original_val_acc (after at least one prune).
-  - Report the last trained cycle model (no extra final retrain).
-
-Backbone matches BayesianFNN (LayerNorm + SiLU). No λ param-count penalty.
-"""
-
 from __future__ import annotations
+import torch.nn.functional as F
 
 import copy
 import json
@@ -24,25 +12,14 @@ import torch.nn.functional as F
 import torch.optim as optim
 from tqdm import tqdm
 
-from BayesianFNN import BayesianFNN
-from main_plasticity import (
-    SEED,
-    build_dataloaders,
-    device,
-    ensure_output_dir,
-    loss_function,
-    set_seed,
-    truncate_and_load_encoder_layer,
-    write_experiment_summary_csv,
-)
+from lib.data import build_dataloaders
+from lib.plasticity import truncate_and_load_encoder_layer
+from lib.seed import SEED, device, set_seed
+from lib.train import ensure_output_dir, loss_function, write_experiment_summary_csv
+from models.bayesian_fnn import BayesianFNN
 
 INPUT_DIM = 784
 NUM_CLASSES = 10
-
-
-# ---------------------------------------------------------------------------
-# Mean-field helpers (BayesianFNN forward is always stochastic)
-# ---------------------------------------------------------------------------
 
 
 def _linear_mean_field(layer, x):
@@ -64,11 +41,6 @@ def count_params(model: BayesianFNN) -> int:
 
 def hidden_widths(model: BayesianFNN):
     return [int(layer.out_features) for layer in model.layers]
-
-
-# ---------------------------------------------------------------------------
-# Train / eval
-# ---------------------------------------------------------------------------
 
 
 def train_epoch(model, loader, optimizer, device_, beta_scaled, epoch=None):
@@ -146,10 +118,7 @@ def train_cycle(
     cycle_idx,
     phase,
 ):
-    """
-    Train with early stopping on validation loss.
-    Restores best-in-cycle weights before return.
-    """
+
     optimizer = make_optimizer(model, learning_rate)
     best = None
     bad_epochs = 0
@@ -222,17 +191,8 @@ def train_cycle(
     }
 
 
-# ---------------------------------------------------------------------------
-# Activation scoring + prune selection
-# ---------------------------------------------------------------------------
-
-
 @torch.no_grad()
 def collect_activation_scores(model: BayesianFNN, loader, device_, max_batches=None):
-    """
-    Mean absolute post-SiLU activation per hidden neuron (mean-field).
-    Returns list of 1D tensors, one per hidden layer.
-    """
     model.eval()
     n_layers = len(model.layers)
     sums = [None] * n_layers
@@ -259,13 +219,6 @@ def collect_activation_scores(model: BayesianFNN, loader, device_, max_batches=N
 
 
 def select_keep_indices(scores, prune_frac, mode):
-    """
-    DropNet minimum / minimum_layer selection.
-
-    scores: list of 1D score tensors (higher = more important).
-    Returns keep_local: list of LongTensors of indices to keep in each layer
-            and dropped_per_layer counts.
-    """
     if mode not in ("global", "layer"):
         raise ValueError(f"prune_mode must be 'global' or 'layer', got {mode!r}")
     if not (0.0 < prune_frac <= 1.0):
@@ -290,7 +243,6 @@ def select_keep_indices(scores, prune_frac, mode):
             dropped.append(n_drop)
         return keep_local, dropped
 
-    # global: drop bottom ceil(p * N_total), but leave >=1 neuron per layer
     all_scores = []
     all_meta = []  # (layer, local_idx)
     for li, s in enumerate(scores):
@@ -299,7 +251,6 @@ def select_keep_indices(scores, prune_frac, mode):
             all_meta.append((li, j))
     n_total = len(all_scores)
     if n_total <= n_layers:
-        # already minimal
         keep_local = [
             torch.arange(w, device=device_, dtype=torch.long) for w in widths
         ]
@@ -312,7 +263,6 @@ def select_keep_indices(scores, prune_frac, mode):
         if len(drop_set) >= n_drop:
             break
         li, _ = all_meta[idx]
-        # would this leave layer empty?
         kept_in_layer = widths[li] - sum(1 for d in drop_set if all_meta[d][0] == li)
         if kept_in_layer <= 1:
             continue
@@ -342,11 +292,6 @@ def rebuild_from_theta0(
     out_features,
     device_,
 ):
-    """
-    Build a BayesianFNN whose params are θ₀ restricted to surviving original indices.
-
-    orig_keep: list of LongTensors, indices into the original dense network per layer.
-    """
     keep_dict = {i: orig_keep[i].detach().cpu() for i in range(len(orig_keep))}
     hidden_sizes = [int(len(keep_dict[i])) for i in range(len(keep_dict))]
     model = BayesianFNN(in_features, hidden_sizes, out_features).to(device_)
@@ -356,7 +301,6 @@ def rebuild_from_theta0(
 
 
 def update_orig_keep(orig_keep, keep_local):
-    """Map current-layer keep indices back to original neuron ids."""
     new_keep = []
     for prev, local in zip(orig_keep, keep_local):
         local_cpu = local.detach().cpu()
@@ -368,17 +312,11 @@ def can_prune(widths):
     return any(w > 1 for w in widths)
 
 
-# ---------------------------------------------------------------------------
-# Experiment loop
-# ---------------------------------------------------------------------------
-
-
 def _write_metrics_csv(path, rows):
     pd.DataFrame(rows).to_csv(path, index=False)
 
 
 def _maybe_update_best(best, cycle_best, model):
-    """Track best validation accuracy across cycles (higher is better)."""
     if best is None or cycle_best["val_acc"] > best["val_acc"]:
         return {
             "state_dict": copy.deepcopy(model.state_dict()),
@@ -436,7 +374,6 @@ def run_dropnet_experiment(
     print("=" * 50)
     print(f"kappa={kappa}, prune_frac={prune_frac}, prune_mode={prune_mode}")
 
-    # -------------------- Prune cycles --------------------
     while True:
         cycle_idx += 1
         phase = "cycle"
@@ -534,7 +471,6 @@ def run_dropnet_experiment(
             f"params={count_params(model)}"
         )
 
-    # Report the last trained cycle model (no extra θ₀ retrain).
     val_final = {
         "acc": float(last_result["val_acc"]),
         "loss": float(last_result["val_loss"]),
@@ -628,13 +564,6 @@ def main(
     early_stop_patience=5,
     max_prune_cycles=40,
 ):
-    """
-    Run Bayesian DropNet on Fashion-MNIST.
-
-    hidden_sizes: dense starting widths (default DropNet-style large MLP).
-    prune_mode: 'global' or 'layer'.
-    kappa: stop when val_acc <= kappa * original_val_acc.
-    """
     h = [max(1, int(w)) for w in hidden_sizes]
     if len(h) < 1:
         raise ValueError("hidden_sizes must be non-empty")
@@ -713,7 +642,7 @@ if __name__ == "__main__":
             for i in range(1, 6):
                 set_seed(SEED + i)
                 main(
-                    f"results_dropnet_FashionMnist_FNN_lenet/run_{i}",
+                    f"results_FashionMnist_FNN/run_{i}",
                     hidden_sizes=(300, 100),
                     prune_frac=0.2,
                     prune_mode=prune_mode,
