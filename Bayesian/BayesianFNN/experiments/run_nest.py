@@ -11,7 +11,7 @@ import torch
 import torch.optim as optim
 from tqdm import tqdm
 
-from lib.data import build_dataloaders
+from lib.data import SUPPORTED_DATASETS, build_dataloaders
 from lib.seed import SEED, device, set_seed
 from lib.train import ensure_output_dir, loss_function, write_experiment_summary_csv
 from models.sparse_bayesian_fnn import (
@@ -442,7 +442,7 @@ def main(
     hidden_sizes=(300, 100),
     seed_activate_frac=0.1,
     seed_scale=1.0,
-    learning_rate=0.005,
+    learning_rate=None,
     beta=0.002,
     batch_size=256,
     reference_acc=90.0,
@@ -455,7 +455,19 @@ def main(
     prune_frac=0.01,
     max_prune_rounds=50,
     prune_retrain_epochs=3,
+    dataset="fashion_mnist",
 ):
+    """
+    dataset options:
+      - "fashion_mnist": Fashion-MNIST (default)
+      - "kmnist": Kuzushiji-MNIST
+    """
+    if dataset not in SUPPORTED_DATASETS:
+        raise ValueError(
+            f"dataset must be one of {sorted(SUPPORTED_DATASETS)}, got {dataset!r}"
+        )
+    if learning_rate is None:
+        learning_rate = 0.005 if dataset == "fashion_mnist" else 0.001
 
     h = [max(1, int(round(w * seed_scale))) for w in hidden_sizes]
     if len(h) != 2:
@@ -463,7 +475,13 @@ def main(
 
     os.makedirs(save_path, exist_ok=True)
     train_loader, val_loader, test_loader = build_dataloaders(
-        "fashion_mnist", batch_size=batch_size, seed=SEED
+        dataset, batch_size=batch_size, seed=SEED
+    )
+    print(
+        f"Dataset: {dataset} "
+        f"(train={len(train_loader.dataset):,}, "
+        f"val={len(val_loader.dataset):,}, "
+        f"test={len(test_loader.dataset):,})"
     )
 
     model = SparseBayesianFNN(INPUT_DIM, h, NUM_CLASSES).to(device)
@@ -486,10 +504,12 @@ def main(
     print("\n" + "=" * 50)
     print("Bayesian NeST setup")
     print("=" * 50)
+    print(f"Dataset: {dataset}")
     print(f"Seed widths: {h}")
     print(f"Seed activate frac: {seed_activate_frac}")
     print(f"Active params (seed): {model.active_param_count()}")
     print(f"Sparsity (seed): {model.sparsity():.3f}")
+    print(f"Learning rate: {learning_rate}")
     print(f"Reference acc: {reference_acc}%")
     print(f"Prune acc floor: {prune_acc_floor}%")
     print(f"Output: {output_dir}")
@@ -497,6 +517,7 @@ def main(
     with open(os.path.join(output_dir, "nest_config.json"), "w", encoding="utf-8") as f:
         json.dump(
             {
+                "dataset": dataset,
                 "seed_hidden_sizes": h,
                 "seed_activate_frac": float(seed_activate_frac),
                 "reference_acc": float(reference_acc),
@@ -533,15 +554,36 @@ def main(
 
 if __name__ == "__main__":
 
-    for prune_acc_floor in [89.0, 88.5, 88.0, 87.5, 87.0]:
+    # for prune_acc_floor in [89.0, 88.5, 88.0, 87.5, 87.0]:
+    #     for i in range(1, 6):
+    #         set_seed(SEED + i)
+    #         main(
+    #             f"results_FashionMnist_FNN/run_{i}",
+    #             hidden_sizes=(300, 100),
+    #             seed_scale=1,
+    #             seed_activate_frac=0.1,
+    #             reference_acc=89.0,
+    #             prune_acc_floor=prune_acc_floor,
+    #             max_growth_epochs=60,
+    #             grow_interval=2,
+    #             conn_grow_frac=0.01,
+    #             beta_growth=0.4,
+    #             birth_strength=0.4,
+    #             prune_frac=0.01,
+    #             max_prune_rounds=200,
+    #             prune_retrain_epochs=2,
+    #         )
+
+    for prune_acc_floor in [95,94.5,94,93.5,93]:
         for i in range(1, 6):
             set_seed(SEED + i)
             main(
-                f"results_FashionMnist_FNN/run_{i}",
+                f"results_kmnist_new/run_{i}",
+                dataset="kmnist",
                 hidden_sizes=(300, 100),
-                seed_scale=1,  
+                seed_scale=1,
                 seed_activate_frac=0.1,
-                reference_acc=89.0,
+                reference_acc=95.0,
                 prune_acc_floor=prune_acc_floor,
                 max_growth_epochs=60,
                 grow_interval=2,
@@ -549,7 +591,7 @@ if __name__ == "__main__":
                 beta_growth=0.4,
                 birth_strength=0.4,
                 prune_frac=0.01,
-                max_prune_rounds=200,
+                max_prune_rounds=800,
                 prune_retrain_epochs=2,
             )
 

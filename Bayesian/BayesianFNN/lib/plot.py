@@ -5,8 +5,10 @@ import re
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
 
 def plot_metrics(metrics_dict, save_path='./results/metrics_comparison.png'):
     """Plot comparison of metrics across all models"""
@@ -435,6 +437,456 @@ def plot_param_count(
         plt.close(fig)
 
     return fig, ax, stats
+
+
+_ACTION_LABELS = ("grow", "retain", "prune")
+_ACTION_FROM_CSV = {"grow": "grow", "none": "retain", "prune": "prune"}
+_ACTION_COLORS = {
+    "grow": "#2ca02c",
+    "retain": "#7f7f7f",
+    "prune": "#d62728",
+}
+
+
+def plot_structural_action_proportions(
+    save_path="results",
+    experiments=None,
+    save_path_out=None,
+    show=True,
+    figsize=(10, 5),
+    dpi=150,
+):
+    """
+    Plot grow / retain / prune decision proportions per plasticity experiment.
+
+    For each run, only decisions with epoch <= Selected epoch (from
+    experiment_summary.csv) are counted. Per-run proportions are then
+    aggregated as mean ± std across runs.
+
+    Example:
+        plot_structural_action_proportions(
+            save_path="results_fashionmnist_new",
+            experiments=[
+                "plasticity_500_0",
+                "plasticity_500_1e-07",
+                "plasticity_500_5e-07",
+                "plasticity_500_1e-06",
+                "plasticity_500_5e-06",
+            ],
+            save_path_out="results_fashionmnist_decision_proportions.png",
+        )
+    """
+    if not experiments:
+        raise ValueError("experiments must be a non-empty list of experiment dir names")
+
+    base = Path(save_path)
+    per_run_rows = []
+
+    for experiment in experiments:
+        meta = _parse_experiment_dir_name(experiment)
+        for run_dir in sorted(base.glob("run_*")):
+            exp_dir = run_dir / experiment
+            decisions_path = exp_dir / "structural_decisions.csv"
+            summary_path = exp_dir / "experiment_summary.csv"
+            if not decisions_path.exists() or not summary_path.exists():
+                continue
+
+            run_id = int(run_dir.name.split("_", 1)[1])
+            selected_epoch = int(pd.read_csv(summary_path).iloc[0]["Selected epoch"])
+            decisions = pd.read_csv(decisions_path)
+            if "epoch" not in decisions.columns or "action" not in decisions.columns:
+                continue
+            kept = decisions.loc[decisions["epoch"] <= selected_epoch].copy()
+            if kept.empty:
+                continue
+
+            mapped = kept["action"].map(_ACTION_FROM_CSV)
+            mapped = mapped.dropna()
+            if mapped.empty:
+                continue
+            total = len(mapped)
+            counts = mapped.value_counts()
+            for action in _ACTION_LABELS:
+                per_run_rows.append(
+                    {
+                        "run": run_id,
+                        "experiment": experiment,
+                        "lambda_penalty": meta.get("lambda_penalty"),
+                        "init_width": meta.get("init_width"),
+                        "experiment_label": meta.get("label", experiment),
+                        "action": action,
+                        "proportion": float(counts.get(action, 0)) / total,
+                        "n_decisions": total,
+                        "selected_epoch": selected_epoch,
+                    }
+                )
+
+    if not per_run_rows:
+        raise FileNotFoundError(
+            f"No structural_decisions.csv (with Selected epoch) found under "
+            f"{save_path} for experiments={experiments}"
+        )
+
+    per_run_df = pd.DataFrame(per_run_rows)
+    stats = (
+        per_run_df.groupby(["experiment", "action"], as_index=False)
+        .agg(
+            mean=("proportion", "mean"),
+            std=("proportion", "std"),
+            n_runs=("run", "nunique"),
+            lambda_penalty=("lambda_penalty", "first"),
+            init_width=("init_width", "first"),
+            experiment_label=("experiment_label", "first"),
+        )
+    )
+    stats["std"] = stats["std"].fillna(0.0)
+
+    # Order experiments: by lambda when all present, else input order.
+    exp_meta = (
+        stats.groupby("experiment", as_index=False)
+        .agg(
+            lambda_penalty=("lambda_penalty", "first"),
+            init_width=("init_width", "first"),
+            experiment_label=("experiment_label", "first"),
+        )
+    )
+    lam_ok = exp_meta["lambda_penalty"].notna().all()
+    if lam_ok:
+        exp_meta = exp_meta.sort_values(
+            ["lambda_penalty", "init_width", "experiment"], kind="mergesort"
+        )
+    else:
+        order = {e: i for i, e in enumerate(experiments)}
+        exp_meta["_order"] = exp_meta["experiment"].map(order)
+        exp_meta = exp_meta.sort_values("_order", kind="mergesort")
+    experiments_ordered = exp_meta["experiment"].tolist()
+
+    widths = exp_meta["init_width"].dropna().unique()
+    mix_widths = len(widths) > 1
+
+    def _xtick_label(row):
+        lam = row["lambda_penalty"]
+        width = row["init_width"]
+        if lam is None or (isinstance(lam, float) and np.isnan(lam)):
+            return row["experiment_label"]
+        if mix_widths and width is not None and not (
+            isinstance(width, float) and np.isnan(width)
+        ):
+            return f"{int(width)}, λ={lam:g}"
+        return f"λ={lam:g}"
+
+    tick_labels = [
+        _xtick_label(exp_meta.loc[exp_meta["experiment"] == e].iloc[0])
+        for e in experiments_ordered
+    ]
+
+    n_groups = len(experiments_ordered)
+    n_actions = len(_ACTION_LABELS)
+    x = np.arange(n_groups)
+    bar_width = 0.8 / n_actions
+
+    fig, ax = plt.subplots(figsize=figsize)
+    for a_idx, action in enumerate(_ACTION_LABELS):
+        means = []
+        stds = []
+        for experiment in experiments_ordered:
+            row = stats.loc[
+                (stats["experiment"] == experiment) & (stats["action"] == action)
+            ]
+            if row.empty:
+                means.append(0.0)
+                stds.append(0.0)
+            else:
+                means.append(float(row.iloc[0]["mean"]))
+                stds.append(float(row.iloc[0]["std"]))
+        offsets = x - 0.4 + bar_width * (a_idx + 0.5)
+        ax.bar(
+            offsets,
+            means,
+            width=bar_width,
+            yerr=stds,
+            color=_ACTION_COLORS[action],
+            label=action,
+            capsize=3,
+            error_kw={"elinewidth": 1.0},
+        )
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(tick_labels, rotation=0)
+    ax.set_ylabel("Proportion of decisions")
+    ax.set_ylim(0.0, 1.05)
+    ax.set_title(
+        "Structural decision proportions up to selected epoch (mean ± std over runs)"
+    )
+    ax.legend(
+        handles=[
+            Patch(facecolor=_ACTION_COLORS[a], edgecolor="none", label=a)
+            for a in _ACTION_LABELS
+        ],
+        title="Action",
+        loc="upper right",
+    )
+    ax.grid(True, axis="y", alpha=0.3)
+    fig.tight_layout()
+
+    if save_path_out is None:
+        save_path_out = "structural_action_proportions.png"
+    fig.savefig(save_path_out, dpi=dpi)
+
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+
+    # Stable column order for callers.
+    stats_out = stats.copy()
+    stats_out["action"] = pd.Categorical(
+        stats_out["action"], categories=list(_ACTION_LABELS), ordered=True
+    )
+    stats_out = stats_out.sort_values(
+        ["experiment", "action"], kind="mergesort"
+    ).reset_index(drop=True)
+    return fig, ax, stats_out
+
+
+# Heatmap category codes (integer matrix values).
+_HEATMAP_NO_DECISION = 0
+_HEATMAP_GROW = 1
+_HEATMAP_RETAIN = 2
+_HEATMAP_PRUNE = 3
+_HEATMAP_AFTER_CHECKPOINT = 4
+_HEATMAP_ACTION_TO_CODE = {
+    "grow": _HEATMAP_GROW,
+    "retain": _HEATMAP_RETAIN,
+    "prune": _HEATMAP_PRUNE,
+}
+_HEATMAP_COLORS = [
+    "#eeeeee",  # no decision
+    _ACTION_COLORS["grow"],
+    _ACTION_COLORS["retain"],
+    _ACTION_COLORS["prune"],
+    "#000000",  # after selected checkpoint
+]
+_HEATMAP_LEGEND = (
+    ("grow", _ACTION_COLORS["grow"]),
+    ("retain", _ACTION_COLORS["retain"]),
+    ("prune", _ACTION_COLORS["prune"]),
+    ("after checkpoint", "#000000"),
+    ("no decision", "#eeeeee"),
+)
+
+
+def plot_structural_decision_heatmap(
+    save_path="results",
+    experiments=None,
+    save_path_out=None,
+    show=True,
+    figsize=None,
+    dpi=150,
+):
+    """
+    Categorical heatmap of grow / retain / prune decisions across λ and runs.
+
+    Rows are grouped by ascending lambda_penalty then run id. Epochs after each
+    run's Selected epoch (min val_total checkpoint) are shown in black.
+
+    Example:
+        plot_structural_decision_heatmap(
+            save_path="results_fashionmnist_new",
+            experiments=[
+                "plasticity_500_0",
+                "plasticity_500_1e-07",
+                "plasticity_500_5e-07",
+                "plasticity_500_1e-06",
+                "plasticity_500_5e-06",
+            ],
+            save_path_out="results_fashionmnist_decision_heatmap.png",
+        )
+    """
+    from matplotlib.colors import BoundaryNorm, ListedColormap
+
+    if not experiments:
+        raise ValueError("experiments must be a non-empty list of experiment dir names")
+
+    base = Path(save_path)
+    row_records = []
+    t_max = 0
+
+    for experiment in experiments:
+        meta = _parse_experiment_dir_name(experiment)
+        for run_dir in sorted(base.glob("run_*")):
+            exp_dir = run_dir / experiment
+            decisions_path = exp_dir / "structural_decisions.csv"
+            summary_path = exp_dir / "experiment_summary.csv"
+            if not decisions_path.exists() or not summary_path.exists():
+                continue
+
+            run_id = int(run_dir.name.split("_", 1)[1])
+            selected_epoch = int(pd.read_csv(summary_path).iloc[0]["Selected epoch"])
+            decisions = pd.read_csv(decisions_path)
+            if "epoch" not in decisions.columns or "action" not in decisions.columns:
+                continue
+
+            run_max_epoch = int(decisions["epoch"].max()) if len(decisions) else 0
+            metrics_path = exp_dir / "metrics.csv"
+            if metrics_path.exists():
+                metrics_df = pd.read_csv(metrics_path)
+                if "epoch" in metrics_df.columns and len(metrics_df):
+                    run_max_epoch = max(run_max_epoch, int(metrics_df["epoch"].max()))
+            t_max = max(t_max, run_max_epoch)
+
+            action_by_epoch = {}
+            for _, drow in decisions.iterrows():
+                mapped = _ACTION_FROM_CSV.get(str(drow["action"]))
+                if mapped is None:
+                    continue
+                action_by_epoch[int(drow["epoch"])] = mapped
+
+            lam = meta.get("lambda_penalty")
+            if lam is None or (isinstance(lam, float) and np.isnan(lam)):
+                row_label = f"{meta.get('label', experiment)}, run {run_id}"
+            else:
+                row_label = f"λ={lam:g}, run {run_id}"
+
+            row_records.append(
+                {
+                    "experiment": experiment,
+                    "run": run_id,
+                    "lambda_penalty": lam if lam is not None else np.nan,
+                    "init_width": meta.get("init_width"),
+                    "selected_epoch": selected_epoch,
+                    "run_max_epoch": run_max_epoch,
+                    "action_by_epoch": action_by_epoch,
+                    "row_label": row_label,
+                }
+            )
+
+    if not row_records or t_max < 1:
+        raise FileNotFoundError(
+            f"No structural_decisions.csv (with Selected epoch) found under "
+            f"{save_path} for experiments={experiments}"
+        )
+
+    row_meta = pd.DataFrame(
+        [{k: v for k, v in r.items() if k != "action_by_epoch"} for r in row_records]
+    )
+    # Attach action maps in the same order as row_records before sort.
+    for i, rec in enumerate(row_records):
+        row_meta.loc[i, "_sort_idx"] = i
+
+    sort_cols = ["lambda_penalty", "run", "experiment"]
+    row_meta = row_meta.sort_values(
+        sort_cols, ascending=[True, True, True], kind="mergesort", na_position="last"
+    ).reset_index(drop=True)
+
+    # Rebuild action maps in sorted order.
+    action_maps = []
+    for _, row in row_meta.iterrows():
+        orig = row_records[int(row["_sort_idx"])]
+        action_maps.append(orig["action_by_epoch"])
+    row_meta = row_meta.drop(columns=["_sort_idx"])
+
+    n_rows = len(row_meta)
+    H = np.full((n_rows, t_max), _HEATMAP_NO_DECISION, dtype=np.int32)
+    tidy_rows = []
+
+    for r_idx, ((_, row), action_by_epoch) in enumerate(
+        zip(row_meta.iterrows(), action_maps)
+    ):
+        selected_epoch = int(row["selected_epoch"])
+        for epoch in range(1, t_max + 1):
+            if epoch > selected_epoch:
+                code = _HEATMAP_AFTER_CHECKPOINT
+                status = "after_checkpoint"
+            elif epoch in action_by_epoch:
+                action = action_by_epoch[epoch]
+                code = _HEATMAP_ACTION_TO_CODE[action]
+                status = action
+            else:
+                code = _HEATMAP_NO_DECISION
+                status = "no_decision"
+            H[r_idx, epoch - 1] = code
+            tidy_rows.append(
+                {
+                    "experiment": row["experiment"],
+                    "run": int(row["run"]),
+                    "lambda_penalty": row["lambda_penalty"],
+                    "epoch": epoch,
+                    "selected_epoch": selected_epoch,
+                    "status": status,
+                }
+            )
+
+    if figsize is None:
+        figsize = (14, max(4.0, 0.35 * n_rows))
+
+    cmap = ListedColormap(_HEATMAP_COLORS)
+    bounds = np.arange(-0.5, len(_HEATMAP_COLORS) + 0.5, 1.0)
+    norm = BoundaryNorm(bounds, cmap.N)
+
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.imshow(
+        H,
+        aspect="auto",
+        interpolation="nearest",
+        cmap=cmap,
+        norm=norm,
+        origin="upper",
+        extent=(0.5, t_max + 0.5, n_rows - 0.5, -0.5),
+    )
+
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Run (grouped by λ)")
+    ax.set_yticks(np.arange(n_rows))
+    ax.set_yticklabels(row_meta["row_label"].tolist(), fontsize=8)
+    # Sparse x ticks for readability when T_max is large.
+    if t_max <= 40:
+        xticks = list(range(1, t_max + 1))
+    else:
+        step = max(1, int(np.ceil(t_max / 20)))
+        xticks = list(range(1, t_max + 1, step))
+        if xticks[-1] != t_max:
+            xticks.append(t_max)
+    ax.set_xticks(xticks)
+    ax.set_xlim(0.5, t_max + 0.5)
+    ax.set_ylim(n_rows - 0.5, -0.5)
+    ax.set_title("Structural decisions by epoch (black = after selected checkpoint)")
+
+    # Horizontal separators between λ blocks.
+    lam_values = row_meta["lambda_penalty"].tolist()
+    for i in range(1, n_rows):
+        prev = lam_values[i - 1]
+        cur = lam_values[i]
+        prev_nan = isinstance(prev, float) and np.isnan(prev)
+        cur_nan = isinstance(cur, float) and np.isnan(cur)
+        if prev_nan != cur_nan or (not prev_nan and not cur_nan and prev != cur):
+            ax.axhline(i - 0.5, color="white", linewidth=1.5, zorder=3)
+
+    ax.legend(
+        handles=[
+            Patch(facecolor=color, edgecolor="0.3", label=label)
+            for label, color in _HEATMAP_LEGEND
+        ],
+        title="Decision",
+        loc="upper left",
+        bbox_to_anchor=(1.02, 1.0),
+        borderaxespad=0.0,
+        fontsize=8,
+    )
+    fig.tight_layout()
+
+    if save_path_out is None:
+        save_path_out = "structural_decision_heatmap.png"
+    fig.savefig(save_path_out, dpi=dpi, bbox_inches="tight")
+
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+
+    matrix_df = pd.DataFrame(tidy_rows)
+    return fig, ax, matrix_df
+
 
 def _junctures_mode_label(mode):
     if mode is None or (isinstance(mode, float) and pd.isna(mode)):
