@@ -860,14 +860,16 @@ def structural_decision_juncture(
     """
     Evaluate growth and/or prune candidates via delta penalised ELBO on B_val.
     Deltas are relative to a warm-started baseline (same K steps as candidates).
-    junctures_mode: "both" (grow+prune), "grow" (grow only), or "prune" (prune only).
+    junctures_mode: "both" (grow or prune), "grow" (grow only), "prune" (prune only),
+    or "both_gp" (grow, prune, or grow+prune combined).
     grow_new_only_steps: for grow warm-start, apply new-only mask for this many initial
     steps (default None = all K steps); remaining steps update all parameters.
     Returns (action, model, hidden_sizes, info_dict).
     """
-    if junctures_mode not in ("both", "grow", "prune"):
+    if junctures_mode not in ("both", "grow", "prune", "both_gp"):
         raise ValueError(
-            f"junctures_mode must be 'both', 'grow', or 'prune', got {junctures_mode!r}"
+            f"junctures_mode must be 'both', 'grow', 'prune', or 'both_gp', "
+            f"got {junctures_mode!r}"
         )
     train_dataset_size = len(train_loader.dataset)
     beta_scaled = (1 / train_dataset_size) * beta
@@ -910,6 +912,7 @@ def structural_decision_juncture(
         'L_after_none': L_after_none,
         'delta_grow': None,
         'delta_prune': None,
+        'delta_grow_prune': None,
         'param_count_before': count_params(model),
         'prune_mode': prune_mode,
         'global_prune_budget': global_prune_budget,
@@ -929,7 +932,7 @@ def structural_decision_juncture(
     layer_idx = None
     delta_grow = float('-inf')
 
-    if junctures_mode in ("both", "grow"):
+    if junctures_mode in ("both", "grow", "both_gp"):
         grow_model, hidden_sizes_g, layer_idx, old_width = neurogenesis(
             model,
             hidden_sizes,
@@ -964,7 +967,7 @@ def structural_decision_juncture(
     hidden_sizes_p = None
     keep_dict = None
 
-    if junctures_mode in ("both", "prune"):
+    if junctures_mode in ("both", "prune", "both_gp"):
         keep_dict, prune_stats = neuroapoptosis(
             model,
             rho,
@@ -996,6 +999,57 @@ def structural_decision_juncture(
             delta_prune = L_after_prune - L_after_none
         info['delta_prune'] = delta_prune if keep_dict is not None else None
 
+    # Combined grow+prune candidate (both_gp only): grow then prune, full warm-start
+    # (no new-neuron isolation), same warm-start style as the prune branch.
+    delta_grow_prune = float('-inf')
+    grow_prune_model = None
+    hidden_sizes_gp = None
+    if junctures_mode == "both_gp":
+        gp_grow_model, _, layer_idx_gp, _ = neurogenesis(
+            model,
+            hidden_sizes,
+            exclude=list(grow_exclude_layers),
+            gamma=gamma,
+            uncertainty_combine=uncertainty_combine,
+            growth_layer_score=growth_layer_score,
+            growth_mad_percentile=growth_mad_percentile,
+        )
+        expand_and_load_encoder_layer(model.state_dict(), gp_grow_model)
+        keep_dict_gp, prune_stats_gp = neuroapoptosis(
+            gp_grow_model,
+            rho,
+            snr_combine=snr_combine,
+            prune_mode=prune_mode,
+            min_neurons_per_layer=2,
+            global_prune_budget=global_prune_budget,
+            global_prune_normalize=global_prune_normalize,
+        )
+        if prune_stats_gp:
+            info['grow_prune_target_remove'] = prune_stats_gp.get('target_remove')
+            info['grow_prune_params_removed'] = prune_stats_gp.get('params_removed')
+            info['grow_prune_neurons_pruned'] = prune_stats_gp.get('neurons_pruned')
+        if keep_dict_gp is not None:
+            grow_prune_model, hidden_sizes_gp = build_pruned_model(
+                gp_grow_model, keep_dict_gp
+            )
+            warm_start_model_on_batches(
+                grow_prune_model,
+                batches_ws,
+                K,
+                eta_ws,
+                beta_scaled,
+                lambda_penalty,
+            )
+            L_after_grow_prune = penalised_elbo_on_batches(
+                grow_prune_model, batches_val, beta_scaled, lambda_penalty
+            )
+            delta_grow_prune = L_after_grow_prune - L_after_none
+            info['delta_grow_prune'] = delta_grow_prune
+            if layer_idx is None:
+                layer_idx = layer_idx_gp
+        else:
+            info['delta_grow_prune'] = None
+
     best_action = 'none'
     best_model = model
     best_hidden_sizes = hidden_sizes
@@ -1011,6 +1065,22 @@ def structural_decision_juncture(
                 best_action = 'prune'
                 best_model = prune_model
                 best_hidden_sizes = hidden_sizes_p
+    elif junctures_mode == "both_gp":
+        # Max delta > 0; ties prefer grow, then grow_prune, then prune.
+        candidates = []
+        if delta_grow > 0:
+            candidates.append((delta_grow, 0, 'grow', grow_model, hidden_sizes_g))
+        if delta_grow_prune > 0 and grow_prune_model is not None:
+            candidates.append(
+                (delta_grow_prune, 1, 'grow_prune', grow_prune_model, hidden_sizes_gp)
+            )
+        if delta_prune_val > 0:
+            candidates.append(
+                (delta_prune_val, 2, 'prune', prune_model, hidden_sizes_p)
+            )
+        if candidates:
+            candidates.sort(key=lambda c: (-c[0], c[1]))
+            _, _, best_action, best_model, best_hidden_sizes = candidates[0]
     elif junctures_mode == "grow" and delta_grow > 0:
         best_action = 'grow'
         best_model = grow_model
@@ -1041,13 +1111,22 @@ def structural_decision_juncture(
                 f"pruned={info['prune_params_removed']} params "
                 f"({info['prune_neurons_pruned']} neurons)"
             )
+    delta_gp_log = ""
+    if junctures_mode == "both_gp":
+        delta_gp_str = (
+            f"{info['delta_grow_prune']:.4f}"
+            if info['delta_grow_prune'] is not None
+            else "N/A"
+        )
+        delta_gp_log = f", delta_grow_prune={delta_gp_str}"
     print(
         f"\nStructural decision (mode={junctures_mode}, prune_mode={prune_mode}, "
         f"global_prune_budget={global_prune_budget}, "
         f"global_prune_normalize={global_prune_normalize}, "
         f"grow_new_only_steps={resolved_grow_new_only_steps}/{K}): "
         f"L_before={L_before:.4f}, L_after_none={L_after_none:.4f}, "
-        f"delta_grow={delta_grow_str}, delta_prune={info['delta_prune']}, "
+        f"delta_grow={delta_grow_str}, delta_prune={info['delta_prune']}"
+        f"{delta_gp_log}, "
         f"action={best_action}{prune_log}"
     )
     return best_action, best_model, best_hidden_sizes, info

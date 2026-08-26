@@ -95,6 +95,7 @@ def write_experiment_summary_csv(
     test_acc,
     test_brier,
     lambda_penalty,
+    flops,
     selected_checkpoint_metric= "val_total",
     junctures_mode="both",
 ):
@@ -107,6 +108,7 @@ def write_experiment_summary_csv(
         "Test Acc": float(test_acc),
         "Test Brier": float(test_brier),
         "Hidden Sizes": str(list(hidden_sizes)),
+        "FLOPs": int(flops),
         "Lambda Penalty": float(lambda_penalty),
         "Junctures Mode": str(junctures_mode),
         "Selected checkpoint metric": str(selected_checkpoint_metric),

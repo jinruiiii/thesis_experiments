@@ -9,6 +9,7 @@ import torch
 import torch.optim as optim
 
 from lib.data import build_dataloaders
+from lib.flops import dense_fnn_flops
 from lib.plot import _parse_experiment_dir_name, plot_metrics
 from lib.plasticity import (
     _hidden_sizes_from_model,
@@ -261,6 +262,7 @@ def run_three_phase_baseline(
         test_acc=metrics["test_acc"],
         test_brier=metrics["test_brier"],
         lambda_penalty=lambda_penalty,
+        flops=dense_fnn_flops(784, metrics["hidden_sizes"], 10),
         selected_checkpoint_metric=checkpoint_metric_label,
         junctures_mode=junctures_mode,
     )
@@ -512,6 +514,7 @@ def run_experiment(experiment_name, model, train_loader, val_loader, test_loader
         test_acc=metrics["test_acc"],
         test_brier=metrics["test_brier"],
         lambda_penalty=csv_lambda_penalty,
+        flops=dense_fnn_flops(784, metrics["hidden_sizes"], 10),
         selected_checkpoint_metric=checkpoint_metric_label,
         junctures_mode=junctures_mode,
     )
@@ -612,13 +615,14 @@ def run_adaptive_experiment(
     Structural decisions happen at annealed intervals (or fixed if decision_interval is set).
     No structural junctures occur for the first decision_warmup_epochs epochs or the
     last decision_cooldown_epochs epochs (weight-only convergence at the end).
-    junctures_mode: "both" (grow+prune), "grow" (grow only), or "prune" (prune only).
+    junctures_mode: "both" (grow or prune), "grow" (grow only), "prune" (prune only),
+    or "both_gp" (grow, prune, or grow+prune combined).
     global_prune_budget: "params" or "neurons" (only used when prune_mode="global_param").
     global_prune_normalize: "percentile", "zscore", "mad", or "raw" (only used when prune_mode="global_param").
     growth_layer_score: "mean" or "mad" for which layer to expand on grow.
     growth_mad_percentile: percentile of within-layer MAD z-scores when growth_layer_score="mad".
     checkpoint_metric: "val_loss_nll" or "val_loss_total" for best-checkpoint selection.
-    grow_new_only_steps: first N grow warm-start steps use new-only mask; rest update all
+    grow_new_only_steps: first N grow warm-start steps use new-only mask, rest update all
     (default None = all warm_start_steps are new-only).
     """
     if output_dir is None:
@@ -668,6 +672,7 @@ def run_adaptive_experiment(
         'structural_actions': [],
         'structural_delta_grow': [],
         'structural_delta_prune': [],
+        'structural_delta_grow_prune': [],
         'structural_L_before': [],
         'structural_L_after_none': [],
         'structural_hidden_sizes': [],
@@ -787,6 +792,7 @@ def run_adaptive_experiment(
             metrics['structural_actions'].append(action)
             metrics['structural_delta_grow'].append(info.get('delta_grow'))
             metrics['structural_delta_prune'].append(info.get('delta_prune'))
+            metrics['structural_delta_grow_prune'].append(info.get('delta_grow_prune'))
             metrics['structural_L_before'].append(info.get('L_before'))
             metrics['structural_L_after_none'].append(info.get('L_after_none'))
             metrics['structural_hidden_sizes'].append(list(hidden_sizes))
@@ -808,7 +814,11 @@ def run_adaptive_experiment(
                 )
         
 
-            if action == "grow" and growth_cooldown_junctures > 0 and junctures_mode in ("both", "grow"):
+            if (
+                action in ("grow", "grow_prune")
+                and growth_cooldown_junctures > 0
+                and junctures_mode in ("both", "grow", "both_gp")
+            ):
                 grown = info["grow_layer_idx"]
                 growth_cooldown[grown] = growth_cooldown_junctures
 
@@ -894,6 +904,7 @@ def run_adaptive_experiment(
         test_acc=metrics["test_acc"],
         test_brier=metrics["test_brier"],
         lambda_penalty=lambda_penalty,
+        flops=dense_fnn_flops(784, metrics["hidden_sizes"], 10),
         selected_checkpoint_metric=checkpoint_metric_label,
         junctures_mode=junctures_mode,
     )
@@ -904,6 +915,7 @@ def run_adaptive_experiment(
         'action': metrics['structural_actions'],
         'delta_grow': metrics['structural_delta_grow'],
         'delta_prune': metrics['structural_delta_prune'],
+        'delta_grow_prune': metrics['structural_delta_grow_prune'],
         'L_before': metrics['structural_L_before'],
         'L_after_none': metrics['structural_L_after_none'],
         'hidden_sizes': [str(hs) for hs in metrics['structural_hidden_sizes']],
@@ -946,9 +958,6 @@ def main(
     run_mode="plasticity",
 ):
     """
-    dataset options:
-      - "fashion_mnist": Fashion-MNIST (default)
-      - "kmnist": Kuzushiji-MNIST
 
     run_mode options:
       - "baseline": run only fixed-width baseline
@@ -1143,4 +1152,95 @@ def main(
             checkpoint_metric=checkpoint_metric,
             grow_new_only_steps=grow_new_only_steps,
         )
+
+if __name__ == "__main__":
+    hidden_sizes = [500, 500]
+    for hidden_size in [[20,20],[50,50],[100,100],[200,200],[500,500]]:
+        for lambda_penalty in [0,1e-07,5e-07,1e-06,5e-06]:
+            for junctures_mode in ["both"]:
+                for i in range(1, 6):
+                    set_seed(SEED+i)
+                    print("Running Fashion experiment for run", i, f"(junctures_mode={junctures_mode})")
+                    main(
+                        f"results_fashionmnist/run_{i}",
+                        hidden_sizes,
+                        lambda_penalty,
+                        junctures_mode=junctures_mode,
+                        dataset="fashion_mnist",
+                        run_mode="plasticity",
+                    )
+
+
+    hidden_sizes = [500, 500]
+    for lambda_penalty in [0,1e-07,5e-07,1e-06,5e-06]:
+        for junctures_mode in ["prune"]:
+            for i in range(1, 6):
+                set_seed(SEED+i)
+                print("Running Fashion experiment for run", i, f"(junctures_mode={junctures_mode})")
+                main(
+                    f"results_fashionmnist/run_{i}",
+                    hidden_sizes,
+                    lambda_penalty,
+                    junctures_mode=junctures_mode,
+                    dataset="fashion_mnist",
+                    run_mode="plasticity",
+                )
+
+
+    for hidden_size in [[20,20],[50,50],[100,100],[150,150],[200,200]]:
+        for lambda_penalty in [0]:
+            for junctures_mode in ["both"]:
+                for i in range(1,6):
+                    set_seed(SEED+i)
+                    print("Running experiment for run", i, f"(junctures_mode={junctures_mode})")
+                    main(
+                        f"results_fashionmnist/run_{i}",
+                        hidden_size,
+                        lambda_penalty,
+                        junctures_mode=junctures_mode,
+                        dataset="fashion_mnist",
+                        run_mode="baseline",
+                    )
+    print("All experiments completed.")
+
+
+
+    for hidden_size in [[200,200],[150,150],[100,100],[50,50],[20,20]]:
+        for lambda_penalty in [0]:
+            for junctures_mode in ["both"]:
+                for i in range(1,6):
+                    set_seed(SEED+i)
+                    print("Running experiment for run", i, f"(junctures_mode={junctures_mode})")
+                    main(
+                        f"results_fashionmnist/run_{i}",
+                        hidden_size,
+                        lambda_penalty,
+                        junctures_mode=junctures_mode,
+                        dataset="fashion_mnist",
+                        run_mode="three_phase",
+                        three_phase_growth_layer_idx=1,
+                        three_phase_growth_gamma=1,
+                    )
+    print("All experiments completed.")
+
+    for lambda_penalty in [0,1e-07,5e-07,1e-06,5e-06]:
+        for i in range(1, 6):
+            set_seed(SEED+i)
+            plasticity_dir = (
+                f"results_fashionmnist/run_{i}/plasticity_500_{_format_lambda_dir(lambda_penalty)}"
+            )
+            print(
+                "Running static replay for run",
+                i,
+                f"(source={plasticity_dir})",
+            )
+            main(
+                f"results_fashionmnist/run_{i}",
+                [500, 500],  # unused for architecture; taken from plasticity summary
+                lambda_penalty=0,
+                dataset="fashion_mnist",
+                run_mode="static_replay",
+                resume_from_plasticity_dir=plasticity_dir,
+            )
+    print("All static replay experiments completed.")
 

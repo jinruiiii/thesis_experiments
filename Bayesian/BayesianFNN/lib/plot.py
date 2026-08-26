@@ -10,6 +10,8 @@ import pandas as pd
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 
+from lib.flops import parse_hidden_sizes
+
 def plot_metrics(metrics_dict, save_path='./results/metrics_comparison.png'):
     """Plot comparison of metrics across all models"""
     # Define colors for each model
@@ -125,118 +127,6 @@ def plot_metrics(metrics_dict, save_path='./results/metrics_comparison.png'):
     plt.savefig(save_path)
     plt.close()
 
-def get_statistics(
-    save_path="results",
-    experiments=["plasticity"],
-    num_runs=None,
-):
-    """
-    Aggregate per-run experiment summaries into mean/std across runs.
-
-    This function reads the per-run `experiment_summary.csv` files written by
-    `write_experiment_summary_csv(...)` and aggregates across runs.
-
-    Expected layout (as produced by `__main__` at the bottom of this file):
-      - {save_path}/run_{i}/{experiment}/experiment_summary.csv
-
-    Example:
-      - results/run_1/plasticity/experiment_summary.csv
-
-    If `num_runs` is provided, only `run_1..run_{num_runs}` are considered.
-    Otherwise all `run_*` directories found under `save_path` are used.
-
-    Note: `params_def` is kept for backwards compatibility but is ignored when
-    reading from `experiment_summary.csv` (which already stores a single
-    parameter count per run).
-    """
-    save_path = os.path.normpath(str(save_path))
-
-    # Discover run indices from folders named run_<int>
-    run_indices = []
-    if os.path.isdir(save_path):
-        for name in os.listdir(save_path):
-            if not name.startswith("run_"):
-                continue
-            suffix = name[len("run_") :]
-            if suffix.isdigit():
-                run_indices.append(int(suffix))
-    run_indices = sorted(set(run_indices))
-    if num_runs is not None:
-        run_indices = [i for i in run_indices if 1 <= i <= int(num_runs)]
-
-    if not run_indices:
-        raise FileNotFoundError(
-            f"No run folders found under '{save_path}'. Expected folders like '{save_path}/run_1/'."
-        )
-
-    results = {}
-    for experiment in experiments:
-        rows = []
-        for run_i in run_indices:
-            summary_path = os.path.join(
-                save_path, f"run_{run_i}", str(experiment), "experiment_summary.csv"
-            )
-            if not os.path.exists(summary_path):
-                raise FileNotFoundError(
-                    f"Missing experiment summary for run {run_i}: '{summary_path}'"
-                )
-            df = pd.read_csv(summary_path)
-            if df.empty:
-                raise ValueError(f"Empty experiment summary: {summary_path}")
-
-            row0 = df.iloc[0]
-            params = int(float(row0["Parameters"]))
-            best_val_acc = float(row0["Best Val Acc"])
-            best_val_brier = float(row0["Best Val Brier"])
-            test_acc = float(row0["Test Acc"])
-            test_brier = float(row0["Test Brier"])
-
-            rows.append(
-                {
-                    "run": run_i,
-                    "Experiment": str(experiment),
-                    "Parameters": params,
-                    "Best Val Acc": best_val_acc,
-                    "Best Val Brier": best_val_brier,
-                    "Test Acc": test_acc,
-                    "Test Brier": test_brier
-                }
-            )
-
-        per_run = pd.DataFrame(rows).sort_values("run").reset_index(drop=True)
-        summary = pd.DataFrame(
-            [
-                {
-                    "Metric": "Parameters",
-                    "Mean": float(per_run["Parameters"].mean()),
-                    "Std": float(per_run["Parameters"].std(ddof=1)),
-                },
-                {
-                    "Metric": "Best Val Acc",
-                    "Mean": float(per_run["Best Val Acc"].mean()),
-                    "Std": float(per_run["Best Val Acc"].std(ddof=1)),
-                },
-                {
-                    "Metric": "Best Val Brier",
-                    "Mean": float(per_run["Best Val Brier"].mean()),
-                    "Std": float(per_run["Best Val Brier"].std(ddof=1)),
-                },
-                                {
-                    "Metric": "Test Acc",
-                    "Mean": float(per_run["Test Acc"].mean()),
-                    "Std": float(per_run["Test Acc"].std(ddof=1)),
-                },
-                                {
-                    "Metric": "Test Brier",
-                    "Mean": float(per_run["Test Brier"].mean()),
-                    "Std": float(per_run["Test Brier"].std(ddof=1)),
-                },
-            ]
-        )
-
-        results[str(experiment)] = {"per_run": per_run, "summary": summary}
-
-    return results
 
 
 def plot_param_count(
@@ -249,24 +139,33 @@ def plot_param_count(
     show=True,
     figsize=(12, 6),
     dpi=150,
+    axis_label_fontsize=None,
+    tick_label_fontsize=None,
+    title_fontsize=None,
+    legend_fontsize=None,
+    ylim=None,
+    yoffset_fontsize=None,
 ):
-    """
-    Plot parameter count vs epoch with mean line and std band per initial width,
-    aggregated across run_* folders.
-
-    Pass one lambda per call (e.g. all plasticity_*_1e-06); mixing lambdas with
-    the same init_width pools them under that width.
-
-    If show_individual is True, plot one line per run (no mean/std band) with a
-    checkpoint dot per run at its selected epoch. Otherwise plot mean line, std
-    band, and aggregated checkpoint markers per init_width.
-    """
     base = Path(save_path)
     rows = []
     checkpoint_rows = []
 
+    def _legend_label_for_experiment(meta):
+        """Prefer [w,w] λ=… for FNN plasticity init-width sweeps."""
+        kind = meta.get("kind")
+        width = meta.get("init_width")
+        lam = meta.get("lambda_penalty")
+        mode = meta.get("junctures_mode")
+        if kind == "plasticity" and width is not None and lam is not None:
+            label = f"[{int(width)},{int(width)}] λ={lam:g}"
+            if mode not in (None, "both") and not (isinstance(mode, float) and pd.isna(mode)):
+                label = f"{label} ({_junctures_mode_label(mode)})"
+            return label
+        return meta["label"]
+
     for experiment in experiments:
         meta = _parse_experiment_dir_name(experiment)
+        legend_label = _legend_label_for_experiment(meta)
         for run_dir in sorted(base.glob("run_*")):
             exp_dir = run_dir / experiment
             metrics_path = exp_dir / "metrics.csv"
@@ -285,7 +184,7 @@ def plot_param_count(
                         "run": run_id,
                         "init_width": meta["init_width"],
                         "experiment": experiment,
-                        "experiment_label": meta["label"],
+                        "experiment_label": legend_label,
                         "junctures_mode": meta.get("junctures_mode"),
                         "epoch": int(mrow["epoch"]),
                         "param_count": float(mrow["param_count"]),
@@ -298,7 +197,7 @@ def plot_param_count(
                     {
                         "run": run_id,
                         "experiment": experiment,
-                        "experiment_label": meta["label"],
+                        "experiment_label": legend_label,
                         "best_epoch": best_epoch,
                         "best_param_count": float(best_rows.iloc[0]["param_count"]),
                     }
@@ -417,14 +316,32 @@ def plot_param_count(
         for exp in experiments_ordered
         if exp in color_by_experiment
     ]
-    ax.legend(handles=color_handles, title="Experiment", loc="upper right")
-    ax.set_xlabel("Epoch")
-    ax.set_ylabel("Parameter count")
+    legend_kwargs = {
+        "handles": color_handles,
+        "title": "Experiment",
+        "loc": "upper right",
+    }
+    if legend_fontsize is not None:
+        legend_kwargs["fontsize"] = legend_fontsize
+        legend_kwargs["title_fontsize"] = legend_fontsize
+    ax.legend(**legend_kwargs)
+    ax.set_xlabel("Epoch", fontsize=axis_label_fontsize)
+    ax.set_ylabel("Parameter count", fontsize=axis_label_fontsize)
+    if tick_label_fontsize is not None:
+        ax.tick_params(axis="both", labelsize=tick_label_fontsize)
     title_suffix = "per run" if show_individual else "mean ± std"
     checkpoint_note = "; dot = selected checkpoint" if show_checkpoint else ""
-    ax.set_title(f"Parameter count vs epoch ({title_suffix}{checkpoint_note})")
+    ax.set_title(
+        f"Parameter count vs Epoch ",
+        fontsize=title_fontsize,
+    )
+    if ylim is not None:
+        ax.set_ylim(ylim)
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
+    if yoffset_fontsize is not None:
+        # Offset text (e.g. 1e6) is finalized after layout; set size after tight_layout.
+        ax.yaxis.get_offset_text().set_fontsize(yoffset_fontsize)
 
     if save_path_out is None:
         tag = "_".join(experiments[0].split("_")[1:3]) if len(experiments) == 1 else "multi"
@@ -439,6 +356,7 @@ def plot_param_count(
     return fig, ax, stats
 
 
+
 _ACTION_LABELS = ("grow", "retain", "prune")
 _ACTION_FROM_CSV = {"grow": "grow", "none": "retain", "prune": "prune"}
 _ACTION_COLORS = {
@@ -447,206 +365,6 @@ _ACTION_COLORS = {
     "prune": "#d62728",
 }
 
-
-def plot_structural_action_proportions(
-    save_path="results",
-    experiments=None,
-    save_path_out=None,
-    show=True,
-    figsize=(10, 5),
-    dpi=150,
-):
-    """
-    Plot grow / retain / prune decision proportions per plasticity experiment.
-
-    For each run, only decisions with epoch <= Selected epoch (from
-    experiment_summary.csv) are counted. Per-run proportions are then
-    aggregated as mean ± std across runs.
-
-    Example:
-        plot_structural_action_proportions(
-            save_path="results_fashionmnist_new",
-            experiments=[
-                "plasticity_500_0",
-                "plasticity_500_1e-07",
-                "plasticity_500_5e-07",
-                "plasticity_500_1e-06",
-                "plasticity_500_5e-06",
-            ],
-            save_path_out="results_fashionmnist_decision_proportions.png",
-        )
-    """
-    if not experiments:
-        raise ValueError("experiments must be a non-empty list of experiment dir names")
-
-    base = Path(save_path)
-    per_run_rows = []
-
-    for experiment in experiments:
-        meta = _parse_experiment_dir_name(experiment)
-        for run_dir in sorted(base.glob("run_*")):
-            exp_dir = run_dir / experiment
-            decisions_path = exp_dir / "structural_decisions.csv"
-            summary_path = exp_dir / "experiment_summary.csv"
-            if not decisions_path.exists() or not summary_path.exists():
-                continue
-
-            run_id = int(run_dir.name.split("_", 1)[1])
-            selected_epoch = int(pd.read_csv(summary_path).iloc[0]["Selected epoch"])
-            decisions = pd.read_csv(decisions_path)
-            if "epoch" not in decisions.columns or "action" not in decisions.columns:
-                continue
-            kept = decisions.loc[decisions["epoch"] <= selected_epoch].copy()
-            if kept.empty:
-                continue
-
-            mapped = kept["action"].map(_ACTION_FROM_CSV)
-            mapped = mapped.dropna()
-            if mapped.empty:
-                continue
-            total = len(mapped)
-            counts = mapped.value_counts()
-            for action in _ACTION_LABELS:
-                per_run_rows.append(
-                    {
-                        "run": run_id,
-                        "experiment": experiment,
-                        "lambda_penalty": meta.get("lambda_penalty"),
-                        "init_width": meta.get("init_width"),
-                        "experiment_label": meta.get("label", experiment),
-                        "action": action,
-                        "proportion": float(counts.get(action, 0)) / total,
-                        "n_decisions": total,
-                        "selected_epoch": selected_epoch,
-                    }
-                )
-
-    if not per_run_rows:
-        raise FileNotFoundError(
-            f"No structural_decisions.csv (with Selected epoch) found under "
-            f"{save_path} for experiments={experiments}"
-        )
-
-    per_run_df = pd.DataFrame(per_run_rows)
-    stats = (
-        per_run_df.groupby(["experiment", "action"], as_index=False)
-        .agg(
-            mean=("proportion", "mean"),
-            std=("proportion", "std"),
-            n_runs=("run", "nunique"),
-            lambda_penalty=("lambda_penalty", "first"),
-            init_width=("init_width", "first"),
-            experiment_label=("experiment_label", "first"),
-        )
-    )
-    stats["std"] = stats["std"].fillna(0.0)
-
-    # Order experiments: by lambda when all present, else input order.
-    exp_meta = (
-        stats.groupby("experiment", as_index=False)
-        .agg(
-            lambda_penalty=("lambda_penalty", "first"),
-            init_width=("init_width", "first"),
-            experiment_label=("experiment_label", "first"),
-        )
-    )
-    lam_ok = exp_meta["lambda_penalty"].notna().all()
-    if lam_ok:
-        exp_meta = exp_meta.sort_values(
-            ["lambda_penalty", "init_width", "experiment"], kind="mergesort"
-        )
-    else:
-        order = {e: i for i, e in enumerate(experiments)}
-        exp_meta["_order"] = exp_meta["experiment"].map(order)
-        exp_meta = exp_meta.sort_values("_order", kind="mergesort")
-    experiments_ordered = exp_meta["experiment"].tolist()
-
-    widths = exp_meta["init_width"].dropna().unique()
-    mix_widths = len(widths) > 1
-
-    def _xtick_label(row):
-        lam = row["lambda_penalty"]
-        width = row["init_width"]
-        if lam is None or (isinstance(lam, float) and np.isnan(lam)):
-            return row["experiment_label"]
-        if mix_widths and width is not None and not (
-            isinstance(width, float) and np.isnan(width)
-        ):
-            return f"{int(width)}, λ={lam:g}"
-        return f"λ={lam:g}"
-
-    tick_labels = [
-        _xtick_label(exp_meta.loc[exp_meta["experiment"] == e].iloc[0])
-        for e in experiments_ordered
-    ]
-
-    n_groups = len(experiments_ordered)
-    n_actions = len(_ACTION_LABELS)
-    x = np.arange(n_groups)
-    bar_width = 0.8 / n_actions
-
-    fig, ax = plt.subplots(figsize=figsize)
-    for a_idx, action in enumerate(_ACTION_LABELS):
-        means = []
-        stds = []
-        for experiment in experiments_ordered:
-            row = stats.loc[
-                (stats["experiment"] == experiment) & (stats["action"] == action)
-            ]
-            if row.empty:
-                means.append(0.0)
-                stds.append(0.0)
-            else:
-                means.append(float(row.iloc[0]["mean"]))
-                stds.append(float(row.iloc[0]["std"]))
-        offsets = x - 0.4 + bar_width * (a_idx + 0.5)
-        ax.bar(
-            offsets,
-            means,
-            width=bar_width,
-            yerr=stds,
-            color=_ACTION_COLORS[action],
-            label=action,
-            capsize=3,
-            error_kw={"elinewidth": 1.0},
-        )
-
-    ax.set_xticks(x)
-    ax.set_xticklabels(tick_labels, rotation=0)
-    ax.set_ylabel("Proportion of decisions")
-    ax.set_ylim(0.0, 1.05)
-    ax.set_title(
-        "Structural decision proportions up to selected epoch (mean ± std over runs)"
-    )
-    ax.legend(
-        handles=[
-            Patch(facecolor=_ACTION_COLORS[a], edgecolor="none", label=a)
-            for a in _ACTION_LABELS
-        ],
-        title="Action",
-        loc="upper right",
-    )
-    ax.grid(True, axis="y", alpha=0.3)
-    fig.tight_layout()
-
-    if save_path_out is None:
-        save_path_out = "structural_action_proportions.png"
-    fig.savefig(save_path_out, dpi=dpi)
-
-    if show:
-        plt.show()
-    else:
-        plt.close(fig)
-
-    # Stable column order for callers.
-    stats_out = stats.copy()
-    stats_out["action"] = pd.Categorical(
-        stats_out["action"], categories=list(_ACTION_LABELS), ordered=True
-    )
-    stats_out = stats_out.sort_values(
-        ["experiment", "action"], kind="mergesort"
-    ).reset_index(drop=True)
-    return fig, ax, stats_out
 
 
 # Heatmap category codes (integer matrix values).
@@ -661,7 +379,7 @@ _HEATMAP_ACTION_TO_CODE = {
     "prune": _HEATMAP_PRUNE,
 }
 _HEATMAP_COLORS = [
-    "#eeeeee",  # no decision
+    "#eeeeee",  # no decision (not shown in legend)
     _ACTION_COLORS["grow"],
     _ACTION_COLORS["retain"],
     _ACTION_COLORS["prune"],
@@ -672,7 +390,6 @@ _HEATMAP_LEGEND = (
     ("retain", _ACTION_COLORS["retain"]),
     ("prune", _ACTION_COLORS["prune"]),
     ("after checkpoint", "#000000"),
-    ("no decision", "#eeeeee"),
 )
 
 
@@ -683,12 +400,19 @@ def plot_structural_decision_heatmap(
     show=True,
     figsize=None,
     dpi=150,
+    axis_label_fontsize=None,
+    tick_label_fontsize=None,
+    title_fontsize=None,
+    legend_fontsize=None,
+    ylabels="lambda_blocks",
 ):
     """
     Categorical heatmap of grow / retain / prune decisions across λ and runs.
 
     Rows are grouped by ascending lambda_penalty then run id. Epochs after each
-    run's Selected epoch (min val_total checkpoint) are shown in black.
+    run's Selected epoch (iid) or Best Phase 2 Epoch (prior-shift) are shown in
+    black. When Phase 1 Epochs is available (shift runs), a vertical dashed line
+    marks the Phase 1 / Phase 2 boundary.
 
     Example:
         plot_structural_decision_heatmap(
@@ -702,15 +426,29 @@ def plot_structural_decision_heatmap(
             ],
             save_path_out="results_fashionmnist_decision_heatmap.png",
         )
+
+    axis_label_fontsize / tick_label_fontsize / title_fontsize / legend_fontsize
+    control text sizes. ``None`` keeps this plot's previous defaults (row labels
+    and legend at 8pt; axis/title use matplotlib defaults).
+    ylabels : str
+        ``"lambda_blocks"`` (default): one centered ``λ=…`` label per λ group.
+        ``"lambda_blocks_runs"``: centered ``λ=…`` plus short run indices ``1..n``.
+        ``"full"``: every row labeled ``λ=…, run …``.
     """
     from matplotlib.colors import BoundaryNorm, ListedColormap
 
     if not experiments:
         raise ValueError("experiments must be a non-empty list of experiment dir names")
+    if ylabels not in ("lambda_blocks", "lambda_blocks_runs", "full"):
+        raise ValueError(
+            "ylabels must be 'lambda_blocks', 'lambda_blocks_runs', or 'full', "
+            f"got {ylabels!r}"
+        )
 
     base = Path(save_path)
     row_records = []
     t_max = 0
+    phase1_epochs = None
 
     for experiment in experiments:
         meta = _parse_experiment_dir_name(experiment)
@@ -722,7 +460,21 @@ def plot_structural_decision_heatmap(
                 continue
 
             run_id = int(run_dir.name.split("_", 1)[1])
-            selected_epoch = int(pd.read_csv(summary_path).iloc[0]["Selected epoch"])
+            summary_row = pd.read_csv(summary_path).iloc[0]
+            if "Selected epoch" in summary_row.index and pd.notna(summary_row["Selected epoch"]):
+                selected_epoch = int(summary_row["Selected epoch"])
+            elif "Best Phase 2 Epoch" in summary_row.index and pd.notna(
+                summary_row["Best Phase 2 Epoch"]
+            ):
+                selected_epoch = int(summary_row["Best Phase 2 Epoch"])
+            else:
+                continue
+
+            if phase1_epochs is None and "Phase 1 Epochs" in summary_row.index and pd.notna(
+                summary_row["Phase 1 Epochs"]
+            ):
+                phase1_epochs = int(summary_row["Phase 1 Epochs"])
+
             decisions = pd.read_csv(decisions_path)
             if "epoch" not in decisions.columns or "action" not in decisions.columns:
                 continue
@@ -733,6 +485,12 @@ def plot_structural_decision_heatmap(
                 metrics_df = pd.read_csv(metrics_path)
                 if "epoch" in metrics_df.columns and len(metrics_df):
                     run_max_epoch = max(run_max_epoch, int(metrics_df["epoch"].max()))
+                if (
+                    phase1_epochs is None
+                    and "phase1_epochs" in metrics_df.columns
+                    and len(metrics_df)
+                ):
+                    phase1_epochs = int(metrics_df["phase1_epochs"].iloc[0])
             t_max = max(t_max, run_max_epoch)
 
             action_by_epoch = {}
@@ -763,8 +521,8 @@ def plot_structural_decision_heatmap(
 
     if not row_records or t_max < 1:
         raise FileNotFoundError(
-            f"No structural_decisions.csv (with Selected epoch) found under "
-            f"{save_path} for experiments={experiments}"
+            f"No structural_decisions.csv (with Selected epoch or Best Phase 2 Epoch) "
+            f"found under {save_path} for experiments={experiments}"
         )
 
     row_meta = pd.DataFrame(
@@ -835,10 +593,65 @@ def plot_structural_decision_heatmap(
         extent=(0.5, t_max + 0.5, n_rows - 0.5, -0.5),
     )
 
-    ax.set_xlabel("Epoch")
-    ax.set_ylabel("Run (grouped by λ)")
-    ax.set_yticks(np.arange(n_rows))
-    ax.set_yticklabels(row_meta["row_label"].tolist(), fontsize=8)
+    if phase1_epochs is not None and 1 <= phase1_epochs < t_max:
+        ax.axvline(
+            phase1_epochs + 0.5,
+            color="black",
+            linestyle="--",
+            linewidth=1.2,
+            zorder=4,
+        )
+
+    ax.set_xlabel("Epoch", fontsize=axis_label_fontsize)
+    ax.set_ylabel("Run (grouped by λ)", fontsize=axis_label_fontsize)
+    ytick_fs = 8 if tick_label_fontsize is None else tick_label_fontsize
+
+    def _same_lam(a, b):
+        a_nan = isinstance(a, float) and np.isnan(a)
+        b_nan = isinstance(b, float) and np.isnan(b)
+        if a_nan or b_nan:
+            return a_nan and b_nan
+        return a == b
+
+    def _lam_label(lam):
+        if isinstance(lam, float) and np.isnan(lam):
+            return "?"
+        return f"λ={lam:g}"
+
+    lam_values = row_meta["lambda_penalty"].tolist()
+    # Contiguous λ blocks: (start_idx, end_idx inclusive, lam).
+    blocks = []
+    start = 0
+    for i in range(1, n_rows + 1):
+        if i == n_rows or not _same_lam(lam_values[i], lam_values[start]):
+            blocks.append((start, i - 1, lam_values[start]))
+            start = i
+
+    # Horizontal separators between λ blocks.
+    for start_i, end_i, _lam in blocks[1:]:
+        ax.axhline(start_i - 0.5, color="white", linewidth=1.5, zorder=3)
+
+    if ylabels == "full":
+        ax.set_yticks(np.arange(n_rows))
+        ax.set_yticklabels(row_meta["row_label"].tolist(), fontsize=ytick_fs)
+    else:
+        centers = [0.5 * (s + e) for s, e, _ in blocks]
+        lam_tick_labels = [_lam_label(lam) for _, _, lam in blocks]
+        ax.set_yticks(centers)
+        ax.set_yticklabels(lam_tick_labels, fontsize=ytick_fs)
+        if ylabels == "lambda_blocks_runs":
+            # Short run indices as minor ticks (position within each λ block).
+            run_positions = []
+            run_labels = []
+            for s, e, _lam in blocks:
+                for k, row_i in enumerate(range(s, e + 1)):
+                    run_positions.append(row_i)
+                    run_labels.append(str(k + 1))
+            ax.set_yticks(run_positions, minor=True)
+            ax.set_yticklabels(run_labels, minor=True, fontsize=max(6, ytick_fs - 2))
+            ax.tick_params(axis="y", which="minor", length=2, pad=2)
+            ax.tick_params(axis="y", which="major", pad=12)
+
     # Sparse x ticks for readability when T_max is large.
     if t_max <= 40:
         xticks = list(range(1, t_max + 1))
@@ -848,20 +661,16 @@ def plot_structural_decision_heatmap(
         if xticks[-1] != t_max:
             xticks.append(t_max)
     ax.set_xticks(xticks)
+    if tick_label_fontsize is not None:
+        ax.tick_params(axis="x", labelsize=tick_label_fontsize)
     ax.set_xlim(0.5, t_max + 0.5)
     ax.set_ylim(n_rows - 0.5, -0.5)
-    ax.set_title("Structural decisions by epoch (black = after selected checkpoint)")
+    ax.set_title(
+        "Structural decisions by epoch",
+        fontsize=title_fontsize,
+    )
 
-    # Horizontal separators between λ blocks.
-    lam_values = row_meta["lambda_penalty"].tolist()
-    for i in range(1, n_rows):
-        prev = lam_values[i - 1]
-        cur = lam_values[i]
-        prev_nan = isinstance(prev, float) and np.isnan(prev)
-        cur_nan = isinstance(cur, float) and np.isnan(cur)
-        if prev_nan != cur_nan or (not prev_nan and not cur_nan and prev != cur):
-            ax.axhline(i - 0.5, color="white", linewidth=1.5, zorder=3)
-
+    legend_fs = 8 if legend_fontsize is None else legend_fontsize
     ax.legend(
         handles=[
             Patch(facecolor=color, edgecolor="0.3", label=label)
@@ -871,7 +680,8 @@ def plot_structural_decision_heatmap(
         loc="upper left",
         bbox_to_anchor=(1.02, 1.0),
         borderaxespad=0.0,
-        fontsize=8,
+        fontsize=legend_fs,
+        title_fontsize=legend_fs,
     )
     fig.tight_layout()
 
@@ -893,6 +703,8 @@ def _junctures_mode_label(mode):
         return None
     if mode == "both":
         return "grow+prune"
+    if mode == "both_gp":
+        return "grow+prune combo"
     if mode == "prune":
         return "prune only"
     if mode == "grow":
@@ -934,6 +746,7 @@ def _parse_experiment_dir_name(dirname):
       plasticity_20f_20f_5e-06  (CNN)
       plasticity_300_1e-06_prune_only
       plasticity_300_1e-06_grow_only
+      plasticity_500_0_both_gp_only
       static_replay_400_1e-06
       static_replay_400_1e-06_prune_only
       nest_300_100_p0.1_refacc89_flooracc89
@@ -1065,7 +878,7 @@ def _parse_experiment_dir_name(dirname):
             "junctures_mode": "both",
             "label": f"plasticity+three-phase {channels} λ={lam:g}",
         })
-    m = re.match(r"^plasticity_(\d+)_([0-9.e+-]+)_(prune|grow)_only$", name)
+    m = re.match(r"^plasticity_(\d+)_([0-9.e+-]+)_(prune|grow|both_gp)_only$", name)
     if m:
         width = int(m.group(1))
         lam = float(m.group(2))
@@ -1089,7 +902,7 @@ def _parse_experiment_dir_name(dirname):
             "junctures_mode": "both",
             "label": f"plasticity {width} λ={lam:g}",
         })
-    m = re.match(r"^plasticity_(\d+)f(?:_\d+f)*_([0-9.e+-]+)_(prune|grow)_only$", name)
+    m = re.match(r"^plasticity_(\d+)f(?:_\d+f)*_([0-9.e+-]+)_(prune|grow|both_gp)_only$", name)
     if m:
         width = int(m.group(1))
         lam = float(m.group(2))
@@ -1165,6 +978,70 @@ def _parse_experiment_dir_name(dirname):
         "junctures_mode": None,
         "label": raw_name,
     })
+def _resolve_summary_x_value(row0, x_col):
+    """Map CSV columns onto the plot x value.
+
+    Nest summaries use ``Sparse Parameters`` / ``Dense Parameters`` (variational
+    μ+ρ counts). Other methods keep ``Parameters``. Resolution:
+
+    - ``FLOPs`` / ``FLOPs_theoretical`` / ``FLOPs_realized`` → CSV ``FLOPs``
+    - ``Parameters`` → Nest prefers Sparse Parameters if present, else Parameters
+    - ``Sparse Parameters`` → Nest sparse; non-Nest falls back to Parameters
+    - ``Dense Parameters`` → Nest dense; non-Nest falls back to Parameters
+    """
+    def _has(col):
+        return col in row0.index and not pd.isna(row0[col])
+
+    if x_col in ("FLOPs", "FLOPs_theoretical", "FLOPs_realized"):
+        if not _has("FLOPs"):
+            raise KeyError(
+                "experiment_summary.csv is missing 'FLOPs'. "
+                "Run scripts/backfill_flops_summary.py on this results tree, "
+                "or re-run the experiment with an updated summary writer."
+            )
+        return float(row0["FLOPs"])
+
+    if x_col == "Parameters":
+        if _has("Sparse Parameters"):
+            return float(row0["Sparse Parameters"])
+        return float(row0["Parameters"])
+    if x_col == "Sparse Parameters":
+        if _has("Sparse Parameters"):
+            return float(row0["Sparse Parameters"])
+        return float(row0["Parameters"])
+    if x_col == "Dense Parameters":
+        if _has("Dense Parameters"):
+            return float(row0["Dense Parameters"])
+        return float(row0["Parameters"])
+    return float(row0[x_col])
+
+
+def _summary_param_count(row0) -> int:
+    """Prefer Nest Sparse Parameters; else legacy Parameters column."""
+    if "Sparse Parameters" in row0.index and not pd.isna(row0["Sparse Parameters"]):
+        return int(float(row0["Sparse Parameters"]))
+    return int(float(row0["Parameters"]))
+
+
+def _csv_params_sparse_dense(row0):
+    """Return (params_sparse, params_dense) from a summary row."""
+    def _has(col):
+        return col in row0.index and not pd.isna(row0[col])
+
+    if _has("Parameters"):
+        fallback = float(row0["Parameters"])
+    elif _has("Sparse Parameters"):
+        fallback = float(row0["Sparse Parameters"])
+    elif _has("Dense Parameters"):
+        fallback = float(row0["Dense Parameters"])
+    else:
+        fallback = float("nan")
+
+    sparse = float(row0["Sparse Parameters"]) if _has("Sparse Parameters") else fallback
+    dense = float(row0["Dense Parameters"]) if _has("Dense Parameters") else fallback
+    return sparse, dense
+
+
 def collect_experiment_summaries(
     save_path="results",
     experiments=None,
@@ -1172,27 +1049,10 @@ def collect_experiment_summaries(
     num_runs=None,
     x_col="Parameters",
     y_col="Test Acc",
+    in_features=784,
+    out_features=10,
 ):
-    """
-    Load per-run rows from experiment_summary.csv.
-  Parameters
-    ----------
-    save_path : str
-        Root folder containing run_1, run_2, ...
-    experiments : list[str] or None
-        Explicit experiment folder names, e.g.
-        ["baseline_64", "plasticity_64_1e-06"].
-        If None, auto-discover under each run folder using experiment_glob.
-    experiment_glob : str
-        Glob for auto-discovery, e.g. "plasticity_*", "baseline_*", "*".
-    num_runs : int or None
-        If set, only use run_1 .. run_{num_runs}.
-    x_col, y_col : str
-        Columns from experiment_summary.csv.
-    Returns
-    -------
-    pd.DataFrame with one row per (run, experiment_folder).
-    """
+
     base = Path(save_path)
     if not base.is_dir():
         raise FileNotFoundError(f"save_path not found: {save_path}")
@@ -1228,6 +1088,16 @@ def collect_experiment_summaries(
             if meta.get("kind") != "dropnet":
                 if csv_junctures is not None and not pd.isna(csv_junctures):
                     junctures_mode = str(csv_junctures)
+
+            hidden_raw = row0.get("Hidden Sizes")
+            if hidden_raw is None or (isinstance(hidden_raw, float) and pd.isna(hidden_raw)):
+                raise ValueError(f"'Hidden Sizes' missing in {summary_path}")
+            hidden_sizes = parse_hidden_sizes(hidden_raw)
+            flops_csv = None
+            if "FLOPs" in row0.index and not pd.isna(row0["FLOPs"]):
+                flops_csv = float(row0["FLOPs"])
+            params_sparse, params_dense = _csv_params_sparse_dense(row0)
+
             rows.append(
                 {
                     "run": run_id,
@@ -1243,7 +1113,13 @@ def collect_experiment_summaries(
                     "dropnet_mode": meta.get("dropnet_mode"),
                     "dropnet_kappa": meta.get("dropnet_kappa"),
                     "model_label": str(row0.get("Model", meta["kind"])),
-                    "x": float(row0[x_col]),
+                    "hidden_sizes": hidden_sizes,
+                    "params_sparse": params_sparse,
+                    "params_dense": params_dense,
+                    "FLOPs": flops_csv,
+                    "FLOPs_realized": flops_csv,
+                    "FLOPs_theoretical": flops_csv,
+                    "x": _resolve_summary_x_value(row0, x_col),
                     "y": float(row0[y_col]),
                     "summary_path": str(summary_path),
                 }
@@ -1254,6 +1130,63 @@ def collect_experiment_summaries(
             f"(experiments={experiments}, glob={experiment_glob!r})."
         )
     return pd.DataFrame(rows)
+
+
+def _normalize_nest_x_modes(nest_x_modes):
+    if nest_x_modes is None:
+        modes = ("sparse",)
+    elif isinstance(nest_x_modes, str):
+        modes = (nest_x_modes,)
+    else:
+        modes = tuple(nest_x_modes)
+    allowed = {"sparse", "dense"}
+    if not modes or any(m not in allowed for m in modes):
+        raise ValueError(
+            "nest_x_modes must be a non-empty subset of ('sparse', 'dense'), "
+            f"got {nest_x_modes!r}"
+        )
+    # Preserve caller order but drop duplicates.
+    seen = set()
+    ordered = []
+    for m in modes:
+        if m not in seen:
+            ordered.append(m)
+            seen.add(m)
+    return tuple(ordered)
+
+
+def _expand_nest_x_modes(df, nest_x_modes, x_col):
+    """
+    Optionally duplicate Nest rows so sparse and/or dense param counts appear.
+
+    Only applies when ``x_col`` is a parameter-count axis. Dense copies use
+    ``kind='nest_dense'`` and a distinct experiment id for aggregation.
+    """
+    modes = _normalize_nest_x_modes(nest_x_modes)
+    if x_col not in ("Parameters", "Sparse Parameters", "Dense Parameters"):
+        return df
+    nest = df.loc[df["kind"] == "nest"].copy()
+    if nest.empty:
+        return df
+
+    others = df.loc[df["kind"] != "nest"].copy()
+    parts = [others] if not others.empty else []
+
+    if "sparse" in modes:
+        sparse = nest.copy()
+        sparse["x"] = sparse["params_sparse"]
+        sparse["kind"] = "nest"
+        parts.append(sparse)
+    if "dense" in modes:
+        dense = nest.copy()
+        dense["x"] = dense["params_dense"]
+        dense["kind"] = "nest_dense"
+        dense["experiment"] = dense["experiment"].astype(str) + "__dense"
+        parts.append(dense)
+
+    if not parts:
+        return df
+    return pd.concat(parts, ignore_index=True)
 
 
 def _lambda_penalty_color_map(df, palette=None):
@@ -1271,7 +1204,9 @@ def _lambda_penalty_color_map(df, palette=None):
 def _nest_floor_color_map(df, palette=None):
     """Distinct color per Nest prune-acc floor value."""
     floors = sorted(
-        df.loc[df["kind"] == "nest", "nest_floor_acc"].dropna().unique()
+        df.loc[df["kind"].isin(["nest", "nest_dense"]), "nest_floor_acc"]
+        .dropna()
+        .unique()
     )
     if palette is None:
         # Prefer a warm / distinct range from plasticity λ tab10 blues/reds.
@@ -1292,6 +1227,8 @@ def _dropnet_kappa_color_map(df, palette=None):
 def _junctures_mode_marker(mode):
     if mode == "grow":
         return "^"
+    if mode == "both_gp":
+        return "D"
     return "o"
 
 
@@ -1355,7 +1292,7 @@ def _point_style(
             "linewidth": 1.0,
         }
     if kind == "nest":
-        style = style_map.get("nest", {"color": "#ff7f0e", "marker": "v"})
+        style = style_map.get("nest", {"color": "#8B4513", "marker": "v"})
         floor = row.get("nest_floor_acc")
         if (
             nest_floor_colors is not None
@@ -1372,6 +1309,25 @@ def _point_style(
             "facecolor": color,
             "edgecolor": "black",
             "linewidth": 0.4,
+        }
+    if kind == "nest_dense":
+        style = style_map.get("nest_dense", {"color": "#8B4513", "marker": "v"})
+        floor = row.get("nest_floor_acc")
+        if (
+            nest_floor_colors is not None
+            and floor is not None
+            and not pd.isna(floor)
+            and floor in nest_floor_colors
+        ):
+            color = nest_floor_colors[floor]
+        else:
+            color = style["color"]
+        return {
+            "color": color,
+            "marker": style["marker"],
+            "facecolor": "white",
+            "edgecolor": color,
+            "linewidth": 1.0,
         }
     if kind == "dropnet":
         style = style_map.get("dropnet", {"color": "#17becf", "marker": "^"})
@@ -1505,6 +1461,7 @@ _DEFAULT_JUNCTURES_PARETO_LINESTYLES = {
     "both": "-",
     "prune": "--",
     "grow": ":",
+    "both_gp": "-.",
 }
 
 
@@ -1537,8 +1494,48 @@ def _normalize_junctures_mode_for_pareto(mode):
     return mode if mode else "both"
 
 
+def _kind_display_name_for_pareto(kind):
+    return {
+        "static_replay": "static replay",
+        "three_phase": "three-phase",
+        "plasticity_three_phase": "plasticity+three-phase",
+        "nest": "nest sparse",
+        "nest_dense": "nest dense",
+    }.get(kind, kind)
+
+
+def _pareto_legend_label(kind, junctures_mode=None, init_width=None):
+    """Human-readable Pareto legend entry for a kind / mode / init-width split."""
+    name = _kind_display_name_for_pareto(kind)
+    if init_width is not None and not (isinstance(init_width, float) and pd.isna(init_width)):
+        return f"{name} init={int(init_width)} Pareto"
+
+    if junctures_mode is None:
+        return f"{name} Pareto"
+
+    mode = _normalize_junctures_mode_for_pareto(junctures_mode)
+    # static_replay stores junctures_mode="static_replay" — avoid "static_replay static_replay".
+    if kind == "static_replay" or mode == "static_replay":
+        return f"{name} Pareto"
+    if kind in ("nest", "nest_dense") or mode == "nest":
+        return f"{name} Pareto"
+    if mode == "both":
+        return f"{name} Pareto"
+    if mode == "prune":
+        return f"{name} prune only Pareto"
+    if mode == "grow":
+        return f"{name} grow only Pareto"
+    if mode == "both_gp":
+        return f"{name} grow+prune combo Pareto"
+    pretty = _junctures_mode_label(mode) or mode
+    return f"{name} {pretty} Pareto"
+
+
 def _resolve_pareto_linestyle(pareto_linestyle, kind, init_width=None, junctures_mode=None):
     if not isinstance(pareto_linestyle, dict):
+        # Distinguish nest dense vs sparse frontiers when using the default "--".
+        if kind == "nest_dense" and pareto_linestyle == "--":
+            return ":"
         if junctures_mode is not None and pareto_linestyle == "--":
             # Default string "--" still allows mode-specific styles when splitting.
             return _DEFAULT_JUNCTURES_PARETO_LINESTYLES.get(
@@ -1595,7 +1592,7 @@ def _draw_kind_pareto_frontiers(
                 ax,
                 subset,
                 color=color,
-                label=f"{kind} Pareto",
+                label=_pareto_legend_label(kind),
                 y_goal=y_goal,
                 linestyle=_resolve_pareto_linestyle(linestyle, kind),
                 linewidth=linewidth,
@@ -1608,7 +1605,7 @@ def _draw_kind_pareto_frontiers(
         work = subset.assign(junctures_mode=mode_series)
         for mode, sub in work.groupby("junctures_mode", dropna=False):
             mode_label = _normalize_junctures_mode_for_pareto(mode)
-            label = f"{kind} {mode_label} Pareto"
+            label = _pareto_legend_label(kind, junctures_mode=mode_label)
             ls = _resolve_pareto_linestyle(
                 linestyle, kind, junctures_mode=mode_label
             )
@@ -1631,7 +1628,7 @@ def _draw_kind_pareto_frontiers(
                 ax,
                 subset,
                 color=color,
-                label=f"{kind} Pareto",
+                label=_pareto_legend_label(kind),
                 y_goal=y_goal,
                 linestyle=_resolve_pareto_linestyle(linestyle, kind),
                 linewidth=linewidth,
@@ -1645,11 +1642,11 @@ def _draw_kind_pareto_frontiers(
         )
         for width, sub in subset.groupby("init_width", dropna=False):
             if width is None or (isinstance(width, float) and pd.isna(width)):
-                label = f"{kind} Pareto"
+                label = _pareto_legend_label(kind)
                 line_color = color
             else:
                 width_int = int(width)
-                label = f"{kind} init={width_int} Pareto"
+                label = _pareto_legend_label(kind, init_width=width_int)
                 line_color = width_colors.get(width_int, color)
             ls = _resolve_pareto_linestyle(linestyle, kind, init_width=width)
             handle = _draw_pareto_frontier(
@@ -1669,7 +1666,7 @@ def _draw_kind_pareto_frontiers(
         ax,
         subset,
         color=color,
-        label=f"{kind} Pareto",
+        label=_pareto_legend_label(kind),
         y_goal=y_goal,
         linestyle=_resolve_pareto_linestyle(linestyle, kind),
         linewidth=linewidth,
@@ -1789,7 +1786,7 @@ def _legend_handles_for_test_acc_plot(
             )
     nest_df = df.loc[df["kind"] == "nest"]
     if not nest_df.empty:
-        nest_style = style_map.get("nest", {"color": "#ff7f0e", "marker": "v"})
+        nest_style = style_map.get("nest", {"color": "#8B4513", "marker": "v"})
         floors = sorted(nest_df["nest_floor_acc"].dropna().unique())
         if floors:
             for floor in floors:
@@ -1817,6 +1814,40 @@ def _legend_handles_for_test_acc_plot(
                     markeredgewidth=0.4,
                     markersize=8,
                     label="nest",
+                )
+            )
+    nest_dense_df = df.loc[df["kind"] == "nest_dense"]
+    if not nest_dense_df.empty:
+        nest_dense_style = style_map.get(
+            "nest_dense", {"color": "#8B4513", "marker": "v"}
+        )
+        floors = sorted(nest_dense_df["nest_floor_acc"].dropna().unique())
+        if floors:
+            for floor in floors:
+                color = nest_floor_colors.get(floor, nest_dense_style["color"])
+                handles.append(
+                    Line2D(
+                        [0], [0],
+                        marker=nest_dense_style["marker"],
+                        color="w",
+                        markerfacecolor="white",
+                        markeredgecolor=color,
+                        markeredgewidth=1.0,
+                        markersize=8,
+                        label=f"nest dense floor={floor:g}",
+                    )
+                )
+        else:
+            handles.append(
+                Line2D(
+                    [0], [0],
+                    marker=nest_dense_style["marker"],
+                    color="w",
+                    markerfacecolor="white",
+                    markeredgecolor=nest_dense_style["color"],
+                    markeredgewidth=1.0,
+                    markersize=8,
+                    label="nest dense",
                 )
             )
     dropnet_df = df.loc[df["kind"] == "dropnet"]
@@ -1881,7 +1912,7 @@ def plot_param_count_vs_test_acc(
     aggregate_runs=True,
     x_col="Parameters",
     y_col="Test Acc",
-    xlabel="Parameter count",
+    xlabel=None,
     ylabel="Test accuracy (%)",
     title="Parameter count vs test accuracy",
     save_path_out=None,
@@ -1901,6 +1932,15 @@ def plot_param_count_vs_test_acc(
     pareto_frontier_kinds=("baseline", "plasticity"),
     pareto_linestyle="--",
     pareto_linewidth=1.5,
+    legend_mode="full",
+    axis_label_fontsize=None,
+    tick_label_fontsize=None,
+    title_fontsize=None,
+    legend_fontsize=None,
+    nest_x_modes=("sparse",),
+    in_features=784,
+    out_features=10,
+    x_tick_interval=None,
 ):
     """
     Plot parameter count (x) against test accuracy (y) across experiments.
@@ -1976,12 +2016,46 @@ def plot_param_count_vs_test_acc(
         (kind, junctures_mode) when using per_junctures_mode.
     pareto_linewidth : float
         Width of frontier lines.
+    legend_mode : str
+        ``"full"`` (default): point styles (λ / Nest floor / …) plus Pareto lines.
+        ``"pareto"``: only Pareto frontier legend entries.
+    axis_label_fontsize : float or None
+        Font size for x and y axis labels. ``None`` keeps matplotlib default.
+    tick_label_fontsize : float or None
+        Font size for axis tick labels. ``None`` keeps matplotlib default.
+    title_fontsize : float or None
+        Font size for the plot title. ``None`` keeps matplotlib default.
+    legend_fontsize : float or None
+        Font size for legend entries and legend title. ``None`` keeps matplotlib default.
+    nest_x_modes : sequence of str
+        Which Nest parameter counts to plot when ``x_col`` is a parameter axis:
+        ``"sparse"`` and/or ``"dense"``. Default ``("sparse",)``. Use
+        ``("sparse", "dense")`` to show both on the same figure (dense as
+        ``nest_dense`` hollow markers).
+    x_tick_interval : float or None
+        If set, major x-axis ticks are placed every ``x_tick_interval`` units
+        (e.g. ``100_000`` for every 100k parameters). ``None`` keeps matplotlib
+        auto-ticks.
     """
+    if legend_mode not in ("full", "pareto"):
+        raise ValueError(
+            f"legend_mode must be 'full' or 'pareto', got {legend_mode!r}"
+        )
+    nest_x_modes = _normalize_nest_x_modes(nest_x_modes)
     if pareto_scope not in ("global", "per_kind", "per_init_width", "per_junctures_mode"):
         raise ValueError(
             f"pareto_scope must be 'global', 'per_kind', 'per_init_width', or "
             f"'per_junctures_mode', got {pareto_scope!r}"
         )
+    if xlabel is None:
+        if x_col in ("FLOPs", "FLOPs_realized", "FLOPs_theoretical"):
+            xlabel = "FLOPs"
+        elif x_col == "Sparse Parameters":
+            xlabel = "Sparse parameter count"
+        elif x_col == "Dense Parameters":
+            xlabel = "Dense parameter count"
+        else:
+            xlabel = "Parameter count"
     df = collect_experiment_summaries(
         save_path=save_path,
         experiments=experiments,
@@ -1989,7 +2063,10 @@ def plot_param_count_vs_test_acc(
         num_runs=num_runs,
         x_col=x_col,
         y_col=y_col,
+        in_features=in_features,
+        out_features=out_features,
     )
+    df = _expand_nest_x_modes(df, nest_x_modes=nest_x_modes, x_col=x_col)
     if style_map is None:
         style_map = {
             "baseline": {"color": "black", "marker": "s"},
@@ -1997,7 +2074,8 @@ def plot_param_count_vs_test_acc(
             "plasticity_three_phase": {"color": "#9467bd", "marker": "P"},
             "plasticity": {"color": "#d62728", "marker": "o"},
             "static_replay": {"color": "#2ca02c", "marker": "X"},
-            "nest": {"color": "#ff7f0e", "marker": "v"},
+            "nest": {"color": "#8B4513", "marker": "v"},
+            "nest_dense": {"color": "#8B4513", "marker": "v"},
             "dropnet": {"color": "#17becf", "marker": "^"},
             "other": {"color": "gray", "marker": "x"},
         }
@@ -2116,7 +2194,8 @@ def plot_param_count_vs_test_acc(
             )["color"],
             "plasticity": style_map["plasticity"]["color"],
             "static_replay": style_map.get("static_replay", {"color": "#2ca02c"})["color"],
-            "nest": style_map.get("nest", {"color": "#ff7f0e"})["color"],
+            "nest": style_map.get("nest", {"color": "#8B4513"})["color"],
+            "nest_dense": style_map.get("nest_dense", {"color": "#8B4513"})["color"],
             "dropnet": style_map.get("dropnet", {"color": "#17becf"})["color"],
             "other": style_map["other"]["color"],
         }
@@ -2163,21 +2242,38 @@ def plot_param_count_vs_test_acc(
                     )
                 )
 
-    handles = _legend_handles_for_test_acc_plot(
-        df,
-        style_map,
-        lambda_colors,
-        style_by_junctures,
-        nest_floor_colors=nest_floor_colors,
-        dropnet_kappa_colors=dropnet_kappa_colors,
-        dropnet_style_by_mode=dropnet_style_by_mode,
-    )
-    handles.extend(pareto_handles)
-    legend_title = "Model / λ / junctures" if style_by_junctures else "Model / λ / nest floor"
-    ax.legend(handles=handles, title=legend_title)
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel(ylabel)
-    ax.set_title(title)
+    if legend_mode == "full":
+        handles = _legend_handles_for_test_acc_plot(
+            df,
+            style_map,
+            lambda_colors,
+            style_by_junctures,
+            nest_floor_colors=nest_floor_colors,
+            dropnet_kappa_colors=dropnet_kappa_colors,
+            dropnet_style_by_mode=dropnet_style_by_mode,
+        )
+        handles.extend(pareto_handles)
+        legend_title = (
+            "Model / λ / junctures" if style_by_junctures else "Model / λ / nest floor"
+        )
+    else:
+        handles = list(pareto_handles)
+        legend_title = "Pareto"
+    if handles:
+        legend_kwargs = {"handles": handles, "title": legend_title}
+        if legend_fontsize is not None:
+            legend_kwargs["fontsize"] = legend_fontsize
+            legend_kwargs["title_fontsize"] = legend_fontsize
+        ax.legend(**legend_kwargs)
+    ax.set_xlabel(xlabel, fontsize=axis_label_fontsize)
+    ax.set_ylabel(ylabel, fontsize=axis_label_fontsize)
+    if x_tick_interval is not None:
+        from matplotlib.ticker import MultipleLocator
+
+        ax.xaxis.set_major_locator(MultipleLocator(float(x_tick_interval)))
+    if tick_label_fontsize is not None:
+        ax.tick_params(axis="both", labelsize=tick_label_fontsize)
+    ax.set_title(title, fontsize=title_fontsize)
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
     if save_path_out is not None:

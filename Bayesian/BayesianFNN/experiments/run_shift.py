@@ -43,6 +43,7 @@ from experiments.run_plasticity import (
     _static_replay_output_dir,
     write_static_replay_provenance,
 )
+from lib.flops import dense_fnn_flops
 from lib.plot import _parse_experiment_dir_name
 from lib.plasticity import expand_and_load_encoder_layer, structural_decision_juncture
 from lib.seed import SEED, device
@@ -431,6 +432,7 @@ def write_shift_summary_csv(
     lambda_penalty,
     phase1_epochs,
     phase2_epochs,
+    flops,
     junctures_mode="both",
     selected_checkpoint_metric="phase2_val_total",
     run_mode="plasticity",
@@ -471,6 +473,7 @@ def write_shift_summary_csv(
         "Phase1 Matched Forget Acc": float(phase1_matched_forget_acc),
         "Phase1 Matched Forget Group A Acc": float(phase1_matched_forget_group_a_acc),
         "Hidden Sizes": str(list(hidden_sizes)),
+        "FLOPs": int(flops),
         "Lambda Penalty": float(lambda_penalty),
         "Junctures Mode": str(junctures_mode),
         "Phase 1 Epochs": int(phase1_epochs),
@@ -1174,6 +1177,7 @@ def run_prior_shift_experiment(
         lambda_penalty=csv_lambda_penalty,
         phase1_epochs=phase1_epochs,
         phase2_epochs=phase2_epochs,
+        flops=dense_fnn_flops(784, metrics["hidden_sizes"], 10),
         junctures_mode=junctures_mode,
         selected_checkpoint_metric=checkpoint_metric_label,
         run_mode=run_mode,

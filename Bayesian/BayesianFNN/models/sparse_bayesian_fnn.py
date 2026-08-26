@@ -118,14 +118,29 @@ class SparseBayesianFNN(nn.Module):
         return sum(layer.kl_loss() for layer in self.all_masked_layers())
 
     def active_param_count(self):
+        """Active connections (weights + biases once each; not μ/ρ variational count)."""
         return sum(layer.active_param_count() for layer in self.all_masked_layers())
+
+    def layernorm_param_count(self):
+        return sum(p.numel() for ln in self.ln_layers for p in ln.parameters())
+
+    def sparse_param_count(self):
+        """Variational params on active connections: 2×(weights+biases) + LayerNorm."""
+        return 2 * self.active_param_count() + self.layernorm_param_count()
+
+    def dense_param_count(self):
+        """All stored nn.Parameters (dense μ/ρ tensors + LayerNorm)."""
+        return sum(p.numel() for p in self.parameters())
 
     def get_param_stats(self):
         active = self.active_param_count()
-        total = sum(p.numel() for p in self.parameters())
+        sparse = self.sparse_param_count()
+        dense = self.dense_param_count()
         return {
-            "total_params": total,
+            "total_params": dense,
             "active_params": active,
+            "sparse_params": sparse,
+            "dense_params": dense,
             "trainable_params": sum(p.numel() for p in self.parameters() if p.requires_grad),
             "frozen_params": 0,
         }

@@ -847,7 +847,7 @@ def main(
     in_channels = DATASET_CONFIGS[dataset]["in_channels"]
     num_classes = DATASET_CONFIGS[dataset]["num_classes"]
 
-    num_epochs = 60
+    num_epochs = 90
     batch_size = 64
     learning_rate = 0.01
     beta = 0.01
@@ -1060,7 +1060,7 @@ def test_conv_surgery():
 if __name__ == "__main__":
 
 
-    for channels in [[100, 100],[150,150],[20, 20], [50, 50]]:
+    for channels in [[100, 100],[75, 75],[50, 50], [25, 25]]:
         for lambda_penalty in [0]:
             for i in range(1, 6):
                 set_seed(SEED + i)

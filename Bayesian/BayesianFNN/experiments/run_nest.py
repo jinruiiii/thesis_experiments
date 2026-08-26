@@ -12,8 +12,9 @@ import torch.optim as optim
 from tqdm import tqdm
 
 from lib.data import SUPPORTED_DATASETS, build_dataloaders
+from lib.flops import theoretical_sparse_fnn_flops
 from lib.seed import SEED, device, set_seed
-from lib.train import ensure_output_dir, loss_function, write_experiment_summary_csv
+from lib.train import ensure_output_dir, loss_function
 from models.sparse_bayesian_fnn import (
     SparseBayesianFNN,
     cleanup_dead_neurons,
@@ -25,6 +26,45 @@ from models.sparse_bayesian_fnn import (
 
 INPUT_DIM = 784
 NUM_CLASSES = 10
+
+
+def write_nest_experiment_summary_csv(
+    output_dir,
+    *,
+    sparse_params,
+    dense_params,
+    flops,
+    hidden_sizes,
+    best_epoch,
+    best_val_total,
+    best_val_acc,
+    best_val_brier,
+    test_acc,
+    test_brier,
+):
+    """Write Nest summary with sparse/dense variational param counts (no legacy Parameters)."""
+    summary_df = pd.DataFrame(
+        [
+            {
+                "Model": "bayesian_nest",
+                "Sparse Parameters": int(sparse_params),
+                "Dense Parameters": int(dense_params),
+                "Best Val Acc": float(best_val_acc),
+                "Best Val Brier": float(best_val_brier),
+                "Test Acc": float(test_acc),
+                "Test Brier": float(test_brier),
+                "Hidden Sizes": str(list(hidden_sizes)),
+                "FLOPs": int(flops),
+                "Lambda Penalty": 0.0,
+                "Junctures Mode": "nest",
+                "Selected checkpoint metric": "val_acc",
+                "Selected epoch": int(best_epoch),
+                "Selected val_total": float(best_val_total),
+            }
+        ]
+    )
+    summary_df.to_csv(os.path.join(output_dir, "experiment_summary.csv"), index=False)
+    return summary_df.iloc[0].to_dict()
 
 def train_epoch(model, loader, optimizer, device, beta_scaled, epoch=None):
     model.train()
@@ -98,7 +138,6 @@ def _write_metrics_csv(path, rows):
 
 
 def _maybe_update_best(best, val_stats, model, global_epoch):
-    """Track best validation accuracy checkpoint (higher is better)."""
     if best is None or val_stats["acc"] > best["val_acc"]:
         return {
             "state_dict": copy.deepcopy(model.state_dict()),
@@ -133,13 +172,6 @@ def run_nest_experiment(
     prune_retrain_epochs=3,
     growth_signal_batches=8,
 ):
-    """
-    reference_acc:
-      Stop growth once validation accuracy (%) is >= this target.
-    prune_acc_floor:
-      Reject a prune step if val acc falls below this floor (lower floor =>
-      allow more pruning / smaller nets). Defaults to reference_acc.
-    """
     ensure_output_dir(output_dir)
     if prune_acc_floor is None:
         prune_acc_floor = float(reference_acc)
@@ -357,12 +389,17 @@ def run_nest_experiment(
             "state_dict": copy.deepcopy(model.state_dict()),
         }
 
-    active_params = model.active_param_count()
-    write_experiment_summary_csv(
+    sparse_params = model.sparse_param_count()
+    dense_params = model.dense_param_count()
+    active_weights = sum(
+        layer.active_weight_count() for layer in model.all_masked_layers()
+    )
+    flops = theoretical_sparse_fnn_flops(active_weights)
+    summary = write_nest_experiment_summary_csv(
         output_dir,
-        model_label="bayesian_nest",
-        params=active_params,
-        trainable_params=active_params,
+        sparse_params=sparse_params,
+        dense_params=dense_params,
+        flops=flops,
         hidden_sizes=model.hidden_widths(),
         best_epoch=int(global_epoch),
         best_val_total=float(val_final["loss"]),
@@ -370,25 +407,7 @@ def run_nest_experiment(
         best_val_brier=float(val_final["brier"]),
         test_acc=float(test_stats["acc"]),
         test_brier=float(test_stats["brier"]),
-        lambda_penalty=0.0,
-        selected_checkpoint_metric="val_acc",
-        junctures_mode="nest",
     )
-    summary = {
-        "Model": "bayesian_nest",
-        "Parameters": active_params,
-        "Trainable Params": active_params,
-        "Best Val Acc": float(val_final["acc"]),
-        "Best Val Brier": float(val_final["brier"]),
-        "Test Acc": float(test_stats["acc"]),
-        "Test Brier": float(test_stats["brier"]),
-        "Hidden Sizes": str(list(model.hidden_widths())),
-        "Lambda Penalty": 0.0,
-        "Junctures Mode": "nest",
-        "Selected checkpoint metric": "val_acc",
-        "Selected epoch": int(global_epoch),
-        "Selected val_total": float(val_final["loss"]),
-    }
 
     _write_metrics_csv(os.path.join(output_dir, "metrics.csv"), metric_rows)
     _write_metrics_csv(os.path.join(output_dir, "structural_events.csv"), event_rows)
@@ -409,7 +428,9 @@ def run_nest_experiment(
             {
                 "hidden_sizes": model.hidden_widths(),
                 "active_params": model.active_param_count(),
-                "total_variational_params": model.get_param_stats()["total_params"],
+                "sparse_params": sparse_params,
+                "dense_params": dense_params,
+                "total_variational_params": dense_params,
                 "sparsity": model.sparsity(),
                 "per_layer_active_weights": [
                     layer.active_weight_count() for layer in model.all_masked_layers()
@@ -428,7 +449,10 @@ def run_nest_experiment(
 
     print("\nBayesian NeST Summary:")
     print(f"  Final widths: {model.hidden_widths()}")
-    print(f"  Active params: {model.active_param_count()}")
+    print(f"  Active connections: {model.active_param_count()}")
+    print(f"  Sparse params: {sparse_params}")
+    print(f"  Dense params: {dense_params}")
+    print(f"  FLOPs: {flops}")
     print(f"  Sparsity: {model.sparsity():.3f}")
     print(f"  Val acc: {val_final['acc']:.2f}%")
     print(f"  Test acc: {test_stats['acc']:.2f}%")
@@ -554,36 +578,15 @@ def main(
 
 if __name__ == "__main__":
 
-    # for prune_acc_floor in [89.0, 88.5, 88.0, 87.5, 87.0]:
-    #     for i in range(1, 6):
-    #         set_seed(SEED + i)
-    #         main(
-    #             f"results_FashionMnist_FNN/run_{i}",
-    #             hidden_sizes=(300, 100),
-    #             seed_scale=1,
-    #             seed_activate_frac=0.1,
-    #             reference_acc=89.0,
-    #             prune_acc_floor=prune_acc_floor,
-    #             max_growth_epochs=60,
-    #             grow_interval=2,
-    #             conn_grow_frac=0.01,
-    #             beta_growth=0.4,
-    #             birth_strength=0.4,
-    #             prune_frac=0.01,
-    #             max_prune_rounds=200,
-    #             prune_retrain_epochs=2,
-    #         )
-
-    for prune_acc_floor in [95,94.5,94,93.5,93]:
+    for prune_acc_floor in [89.0, 88.5, 88.0, 87.5, 87.0]:
         for i in range(1, 6):
             set_seed(SEED + i)
             main(
-                f"results_kmnist_new/run_{i}",
-                dataset="kmnist",
+                f"results_fashionmnist/run_{i}",
                 hidden_sizes=(300, 100),
                 seed_scale=1,
                 seed_activate_frac=0.1,
-                reference_acc=95.0,
+                reference_acc=89.0,
                 prune_acc_floor=prune_acc_floor,
                 max_growth_epochs=60,
                 grow_interval=2,
@@ -591,8 +594,7 @@ if __name__ == "__main__":
                 beta_growth=0.4,
                 birth_strength=0.4,
                 prune_frac=0.01,
-                max_prune_rounds=800,
+                max_prune_rounds=200,
                 prune_retrain_epochs=2,
             )
-
 
