@@ -864,9 +864,11 @@ def main(
     prune_mode = "global_param"
     global_prune_budget = "filters"
     global_prune_normalize = "mad"
-    warm_start_steps = 16
+    # warm_start_steps = 16
+    warm_start_steps = 32
     warm_start_lr = learning_rate * 0.4
-    grow_new_only_steps = 4
+    # grow_new_only_steps = 4
+    grow_new_only_steps = 8
 
     os.makedirs(save_path, exist_ok=True)
     train_loader, val_loader, test_loader = build_dataloaders(
@@ -1060,15 +1062,28 @@ def test_conv_surgery():
 if __name__ == "__main__":
 
 
-    for channels in [[100, 100],[75, 75],[50, 50], [25, 25]]:
-        for lambda_penalty in [0]:
+    # for channels in [[100, 100],[75, 75],[50, 50], [25, 25]]:
+    #     for lambda_penalty in [0]:
+    #         for i in range(1, 6):
+    #             set_seed(SEED + i)
+    #             main(
+    #                 save_path=f"./results_fashionmnist_cnn/run_{i}",
+    #                 conv_channels=channels,
+    #                 lambda_penalty=lambda_penalty,
+    #                 run_mode="baseline",
+    #                 dataset="cifar10",
+    #                 fc_hidden=128,
+    #             )
+
+    for channels in [[300,300]]:
+        for lambda_penalty in [0,1e-07,5e-07,1e-06,5e-06]:
             for i in range(1, 6):
                 set_seed(SEED + i)
                 main(
-                    save_path=f"./results_fashionmnist_cnn/run_{i}",
+                    save_path=f"./results_fashionmnist_cnn_ws32/run_{i}",
                     conv_channels=channels,
                     lambda_penalty=lambda_penalty,
-                    run_mode="baseline",
+                    run_mode="plasticity",
                     dataset="cifar10",
                     fc_hidden=128,
                 )
@@ -1078,11 +1093,14 @@ if __name__ == "__main__":
             for i in range(1, 6):
                 set_seed(SEED + i)
                 main(
-                    save_path=f"./results_fashionmnist_cnn/run_{i}",
+                    save_path=f"./results_fashionmnist_cnn_ws32/run_{i}",
                     conv_channels=channels,
                     lambda_penalty=lambda_penalty,
                     run_mode="plasticity",
                     dataset="cifar10",
                     fc_hidden=128,
+                    junctures_mode="prune"
                 )
+
+
 
