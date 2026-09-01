@@ -11,7 +11,7 @@ import pandas as pd
 import torch
 import torch.optim as optim
 
-from lib.data import DATASET_CONFIGS, build_dataloaders
+from lib.data import DATASET_CONFIGS, build_dataloaders, get_dataset_input_spec
 from lib.plot import _parse_experiment_dir_name, plot_metrics
 from lib.plasticity import (
     _conv_channels_from_model,
@@ -636,7 +636,13 @@ def run_three_phase_baseline(
     phase1_epochs = int(phase1_epochs)
     phase2_epochs = int(phase2_epochs)
     phase3_epochs = int(phase3_epochs)
+    if phase1_epochs < 0:
+        raise ValueError("phase1_epochs must be non-negative")
+    if phase2_epochs <= 0 or phase3_epochs <= 0:
+        raise ValueError("phase2_epochs and phase3_epochs must be positive")
     total_epochs = phase1_epochs + phase2_epochs + phase3_epochs
+    if total_epochs <= 0:
+        raise ValueError("at least one phase must have a positive epoch count")
 
     conv_channels = _conv_channels_from_model(model)
     checkpoint_metric = _normalize_checkpoint_metric(checkpoint_metric)
@@ -645,6 +651,18 @@ def run_three_phase_baseline(
     loss_label = "Penalised ELBO" if lambda_penalty > 0 else "ELBO"
 
     print(f"\n{'-'*20} Running {experiment_name} CNN experiment {'-'*20}")
+    if phase1_epochs == 0:
+        print(
+            "Grow-prune refinement: "
+            f"phase2={phase2_epochs}, phase3={phase3_epochs}, "
+            f"growth_layer_idx={growth_layer_idx}, growth_gamma={growth_gamma}"
+        )
+    else:
+        print(
+            "Three-phase baseline: "
+            f"phase1={phase1_epochs}, phase2={phase2_epochs}, phase3={phase3_epochs}, "
+            f"growth_layer_idx={growth_layer_idx}, growth_gamma={growth_gamma}"
+        )
     print(f"Initial conv channels: {conv_channels}")
 
     optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=learning_rate)
@@ -673,6 +691,7 @@ def run_three_phase_baseline(
             )
             print(
                 f"Added {filters_to_add} filters to conv layer {growth_layer_idx} "
+                f"using base width {old_width} "
                 f"({old_width} -> {conv_channels[growth_layer_idx]})."
             )
         if epoch == phase1_epochs + phase2_epochs + 1 and phase3_epochs > 0:
@@ -721,10 +740,12 @@ def run_three_phase_baseline(
         metrics["phase_history"].append(phase)
         metrics["conv_channel_history"].append(list(conv_channels))
 
+        penalty_str = f", Penalty={train_loss_penalty:.4f}" if lambda_penalty > 0 else ""
         print(
             f"Epoch {epoch} ({phase}): Train Loss({loss_label})={train_loss_total:.4f}, "
-            f"Train Acc={train_acc:.2f}%, Params={count_params(model):,}, "
-            f"Val Acc={val_acc:.2f}%"
+            f"Train Loss(NLL)={train_loss_nll:.4f}, Train Loss(KL)={train_loss_kl:.4f}"
+            f"{penalty_str}, Params={count_params(model):,}, Train Acc={train_acc:.2f}%, "
+            f"Val Loss({loss_label})={val_loss_total:.4f}, Val Acc={val_acc:.2f}%"
         )
 
         if phase == "phase3_pruned":
@@ -751,6 +772,10 @@ def run_three_phase_baseline(
     if best_model_state is not None:
         eval_model = _make_eval_model(model, best_conv_channels)
         eval_model.load_state_dict(best_model_state, strict=True)
+        print(
+            f"Loaded best model from epoch {best_epoch} "
+            f"(conv_channels={best_conv_channels}) for final testing."
+        )
     else:
         eval_model = model
 
@@ -779,6 +804,15 @@ def run_three_phase_baseline(
         "conv_channels": final_conv_channels,
     })
 
+    phase3_val_acc = [
+        acc for acc, ph in zip(metrics["val_acc"], metrics["phase_history"])
+        if ph == "phase3_pruned"
+    ]
+    phase3_val_brier = [
+        brier for brier, ph in zip(metrics["val_brier"], metrics["phase_history"])
+        if ph == "phase3_pruned"
+    ]
+
     write_metrics_csv(output_dir, metrics)
     write_experiment_summary_csv(
         output_dir,
@@ -788,14 +822,30 @@ def run_three_phase_baseline(
         conv_channels=metrics["conv_channels"],
         best_epoch=best_epoch,
         best_val_total=best_checkpoint_score,
-        best_val_acc=max(metrics["val_acc"]),
-        best_val_brier=min(metrics["val_brier"]),
+        best_val_acc=max(phase3_val_acc),
+        best_val_brier=min(phase3_val_brier),
         test_acc=metrics["test_acc"],
         test_brier=metrics["test_brier"],
         lambda_penalty=lambda_penalty,
         selected_checkpoint_metric=checkpoint_metric_label,
         junctures_mode=junctures_mode,
     )
+
+    phase_df = pd.DataFrame({
+        "epoch": range(1, total_epochs + 1),
+        "phase": metrics["phase_history"],
+        "conv_channels": [str(cc) for cc in metrics["conv_channel_history"]],
+        "param_count": metrics["param_count_history"],
+    })
+    phase_history_path = os.path.join(output_dir, "phase_history.csv")
+    phase_df.to_csv(phase_history_path, index=False)
+
+    print(f"\n{experiment_name} Summary:")
+    print(f"Best validation accuracy (phase 3): {max(phase3_val_acc):.2f}%")
+    print(f"Best checkpoint score (phase 3): {best_checkpoint_score:.4f} at epoch {best_epoch}")
+    print(f"Final test accuracy: {test_acc:.2f}%")
+    print(f"Final conv channels: {final_conv_channels}")
+    print(f"Phase history written to {phase_history_path}")
 
     return metrics, model, total_epochs
 
@@ -805,6 +855,7 @@ def main(
     conv_channels,
     lambda_penalty,
     dataset="fashion_mnist",
+    cifar10_grayscale=True,
     junctures_mode="both",
     checkpoint_metric="val_loss_total",
     growth_layer_score="mad",
@@ -814,21 +865,35 @@ def main(
     phase2_epochs=10,
     phase3_epochs=10,
     three_phase_growth_layer_idx=1,
-    three_phase_growth_gamma=None,
+    three_phase_growth_gamma=1,
     resume_from_plasticity_dir=None,
     run_mode="plasticity",
-    fc_hidden=128,
+    fc_hidden=64,
+    warm_start_steps=64,
+    grow_new_only_steps=32
+
 ):
     """
     dataset options:
       - "fashion_mnist"
-      - "cifar10"
+      - "cifar10": use cifar10_grayscale to choose 1-channel greyscale (default) or 3-channel RGB
+
+    cifar10_grayscale:
+      - True (default): convert CIFAR-10 to 1-channel greyscale (32x32)
+      - False: keep original 3-channel RGB (32x32)
 
     run_mode options:
       - "baseline"
       - "plasticity"
-      - "three_phase"
+      - "three_phase": three-phase baseline (train static, grow filters, prune back, train)
       - "static_replay" (requires resume_from_plasticity_dir)
+
+    three_phase options (run_mode="three_phase"):
+      - phase1_epochs: epochs training the initial architecture
+      - phase2_epochs: epochs after growing filters at three_phase_growth_layer_idx
+      - phase3_epochs: epochs after pruning back to original width (checkpoint selection)
+      - three_phase_growth_layer_idx: 0-based conv layer index to grow
+      - three_phase_growth_gamma: fraction of layer width to add (default 1.0)
     """
     allowed_run_modes = {
         "baseline",
@@ -844,12 +909,15 @@ def main(
         raise ValueError(
             f"dataset must be one of {sorted(DATASET_CONFIGS)}, got {dataset!r}"
         )
-    in_channels = DATASET_CONFIGS[dataset]["in_channels"]
+    input_spec = get_dataset_input_spec(dataset, cifar10_grayscale=cifar10_grayscale)
+    in_channels = input_spec["in_channels"]
     num_classes = DATASET_CONFIGS[dataset]["num_classes"]
 
     num_epochs = 90
     batch_size = 64
     learning_rate = 0.01
+    # learning_rate = 0.02
+
     beta = 0.01
     decision_interval_min = 1
     decision_interval_max = 1
@@ -859,23 +927,24 @@ def main(
 
     gamma = 0.0
     rho = 0.1
-    if three_phase_growth_gamma is None:
-        three_phase_growth_gamma = gamma
     prune_mode = "global_param"
     global_prune_budget = "filters"
     global_prune_normalize = "mad"
-    # warm_start_steps = 16
-    warm_start_steps = 32
+    # warm_start_steps = 32
     warm_start_lr = learning_rate * 0.4
     # grow_new_only_steps = 4
-    grow_new_only_steps = 8
 
     os.makedirs(save_path, exist_ok=True)
     train_loader, val_loader, test_loader = build_dataloaders(
-        dataset, batch_size=batch_size, seed=SEED
+        dataset, batch_size=batch_size, seed=SEED, cifar10_grayscale=cifar10_grayscale
     )
+    if dataset == "cifar10":
+        channel_mode = "grayscale, 1ch" if cifar10_grayscale else "rgb, 3ch"
+        dataset_label = f"{dataset} ({channel_mode})"
+    else:
+        dataset_label = dataset
     print(
-        f"Dataset: {dataset} "
+        f"Dataset: {dataset_label} "
         f"(train={len(train_loader.dataset):,}, "
         f"val={len(val_loader.dataset):,}, "
         f"test={len(test_loader.dataset):,})"
@@ -1075,25 +1144,25 @@ if __name__ == "__main__":
     #                 fc_hidden=128,
     #             )
 
-    for channels in [[300,300]]:
-        for lambda_penalty in [0,1e-07,5e-07,1e-06,5e-06]:
-            for i in range(1, 6):
-                set_seed(SEED + i)
-                main(
-                    save_path=f"./results_fashionmnist_cnn_ws32/run_{i}",
-                    conv_channels=channels,
-                    lambda_penalty=lambda_penalty,
-                    run_mode="plasticity",
-                    dataset="cifar10",
-                    fc_hidden=128,
-                )
+    # for channels in [[300,300]]:
+    #     for lambda_penalty in [0,1e-07,5e-07,1e-06,5e-06]:
+    #         for i in range(1, 6):
+    #             set_seed(SEED + i)
+    #             main(
+    #                 save_path=f"./results_fashionmnist_cnn_ws32_gn4/run_{i}",
+    #                 conv_channels=channels,
+    #                 lambda_penalty=lambda_penalty,
+    #                 run_mode="plasticity",
+    #                 dataset="cifar10",
+    #                 fc_hidden=128,
+    #             )
 
     for channels in [[300,300]]:
         for lambda_penalty in [0,1e-07,5e-07,1e-06,5e-06]:
             for i in range(1, 6):
                 set_seed(SEED + i)
                 main(
-                    save_path=f"./results_fashionmnist_cnn_ws32/run_{i}",
+                    save_path=f"./results_fashionmnist_cnn_ws32_gn4/run_{i}",
                     conv_channels=channels,
                     lambda_penalty=lambda_penalty,
                     run_mode="plasticity",

@@ -5,12 +5,16 @@ from torchvision import datasets
 from lib.seed import SEED
 
 DATASET_ROOT = "../../Datasets"
+_CIFAR10_GREYSCALE_WEIGHTS = torch.tensor([0.299, 0.587, 0.114])
+_CIFAR10_RGB_MEAN = (0.4914, 0.4822, 0.4465)
+_CIFAR10_RGB_STD = (0.2023, 0.1994, 0.2010)
+
 DATASET_CONFIGS = {
     "cifar10": {
         "cls": datasets.CIFAR10,
-        "mean": (0.4914, 0.4822, 0.4465),
-        "std": (0.2470, 0.2435, 0.2616),
-        "in_channels": 3,
+        "mean": (0.4807,),
+        "std": (0.2512,),
+        "in_channels": 1,
         "num_classes": 10,
     },
     "fashion_mnist": {
@@ -23,35 +27,104 @@ DATASET_CONFIGS = {
 }
 
 
-def _dataset_to_tensors(raw_dataset, mean, std):
-    """Vectorized ToTensor + Normalize over the whole dataset (done once)."""
-    data = raw_dataset.data
-    if isinstance(data, torch.Tensor):
-        # FashionMNIST: uint8 tensor [N, H, W]
-        x = data.unsqueeze(1).float().div_(255.0)
-    else:
-        # CIFAR-10: uint8 numpy array [N, H, W, C]
-        x = torch.from_numpy(data).permute(0, 3, 1, 2).float().div_(255.0)
+def get_dataset_input_spec(dataset_name, cifar10_grayscale=True):
+    if dataset_name not in DATASET_CONFIGS:
+        raise ValueError(
+            f"dataset must be one of {sorted(DATASET_CONFIGS)}, got {dataset_name!r}"
+        )
+    config = DATASET_CONFIGS[dataset_name]
+    if dataset_name == "cifar10" and not cifar10_grayscale:
+        return {
+            "mean": _CIFAR10_RGB_MEAN,
+            "std": _CIFAR10_RGB_STD,
+            "in_channels": 3,
+        }
+    return {
+        "mean": config["mean"],
+        "std": config["std"],
+        "in_channels": config["in_channels"],
+    }
+
+
+def _normalize_tensors(x, mean, std):
     mean_t = torch.tensor(mean).view(1, -1, 1, 1)
     std_t = torch.tensor(std).view(1, -1, 1, 1)
-    x = x.sub_(mean_t).div_(std_t)
+    return x.sub_(mean_t).div_(std_t)
+
+
+def _fashion_mnist_to_tensors(raw_dataset, mean, std):
+    """Vectorized ToTensor + Normalize over the whole dataset (done once)."""
+    x = raw_dataset.data.unsqueeze(1).float().div_(255.0)
+    x = _normalize_tensors(x, mean, std)
     y = torch.as_tensor(raw_dataset.targets, dtype=torch.long)
     return x, y
 
 
-def build_dataloaders(dataset_name, batch_size, train_frac=0.8, seed=SEED):
+def _cifar10_greyscale_to_tensors(raw_dataset, mean, std):
+    """Convert CIFAR-10 RGB to greyscale NCHW and normalize."""
+    x = torch.from_numpy(raw_dataset.data).float().div_(255.0)
+    x = x.matmul(_CIFAR10_GREYSCALE_WEIGHTS)
+    x = x.unsqueeze(1)
+    x = _normalize_tensors(x, mean, std)
+    y = torch.as_tensor(raw_dataset.targets, dtype=torch.long)
+    return x, y
+
+
+def _cifar10_rgb_to_tensors(raw_dataset, mean, std):
+    """Convert CIFAR-10 RGB to NCHW and normalize."""
+    x = torch.from_numpy(raw_dataset.data).float().div_(255.0)
+    x = x.permute(0, 3, 1, 2)
+    x = _normalize_tensors(x, mean, std)
+    y = torch.as_tensor(raw_dataset.targets, dtype=torch.long)
+    return x, y
+
+
+def _dataset_to_tensors(raw_dataset, dataset_name, mean, std, cifar10_grayscale=True):
+    if dataset_name == "fashion_mnist":
+        return _fashion_mnist_to_tensors(raw_dataset, mean, std)
+    if dataset_name == "cifar10":
+        if cifar10_grayscale:
+            return _cifar10_greyscale_to_tensors(raw_dataset, mean, std)
+        return _cifar10_rgb_to_tensors(raw_dataset, mean, std)
+    raise ValueError(
+        f"dataset must be one of {sorted(DATASET_CONFIGS)}, got {dataset_name!r}"
+    )
+
+
+def build_dataloaders(
+    dataset_name, batch_size, train_frac=0.8, seed=SEED, cifar10_grayscale=True
+):
     if dataset_name not in DATASET_CONFIGS:
         raise ValueError(
             f"dataset must be one of {sorted(DATASET_CONFIGS)}, got {dataset_name!r}"
         )
     config = DATASET_CONFIGS[dataset_name]
     dataset_cls = config["cls"]
+    input_spec = get_dataset_input_spec(dataset_name, cifar10_grayscale=cifar10_grayscale)
+    expected_in_channels = input_spec["in_channels"]
 
     training_data_raw = dataset_cls(root=DATASET_ROOT, train=True, download=True)
     test_data_raw = dataset_cls(root=DATASET_ROOT, train=False, download=True)
 
-    x_all, y_all = _dataset_to_tensors(training_data_raw, config["mean"], config["std"])
-    x_test, y_test = _dataset_to_tensors(test_data_raw, config["mean"], config["std"])
+    x_all, y_all = _dataset_to_tensors(
+        training_data_raw,
+        dataset_name,
+        input_spec["mean"],
+        input_spec["std"],
+        cifar10_grayscale=cifar10_grayscale,
+    )
+    x_test, y_test = _dataset_to_tensors(
+        test_data_raw,
+        dataset_name,
+        input_spec["mean"],
+        input_spec["std"],
+        cifar10_grayscale=cifar10_grayscale,
+    )
+    assert x_all.shape[1] == expected_in_channels
+    assert x_test.shape[1] == expected_in_channels
+    if dataset_name == "cifar10":
+        assert x_all.shape[2:] == (32, 32)
+        assert x_test.shape[2:] == (32, 32)
 
     train_size = int(train_frac * len(training_data_raw))
     val_size = len(training_data_raw) - train_size

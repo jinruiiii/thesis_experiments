@@ -23,6 +23,7 @@ Experiment outputs under `results*` / `results_*/` are also gitignored (see `the
 | Thesis comparison | Module | Typical invocation |
 |---|---|---|
 | Baseline / plasticity / three-phase / static replay | `experiments.run_plasticity` | `python -m experiments.run_plasticity` |
+| NeST (Policies 1, 3, 4.3.1) | `experiments.run_nest` | `python -m experiments.run_nest` |
 
 `experiments.run_plasticity.main(..., run_mode=...)` selects `baseline`, `plasticity`, `three_phase`, or `static_replay`.
 
@@ -52,6 +53,6 @@ This writes:
 ```text
 models/       BayesianCNN (+ vendored BayesianLinear)
 lib/          seed, data, train/eval, grow/prune, plots
-experiments/  plasticity runner
+experiments/  plasticity + NeST runners
 scripts/      figure assembly from saved summaries
 ```
