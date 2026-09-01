@@ -18,14 +18,50 @@ DATASET_ROOT = "../../Datasets"
 SUPPORTED_DATASETS = {
     "fashion_mnist": datasets.FashionMNIST,
     "kmnist": datasets.KMNIST,
+    "cifar10": datasets.CIFAR10,
 }
 
+DATASET_METADATA = {
+    "fashion_mnist": {"input_dim": 784, "num_classes": 10},
+    "kmnist": {"input_dim": 784, "num_classes": 10},
+    "cifar10": {"input_dim": 1024, "num_classes": 10},
+}
 
-def _dataset_to_flat_tensors(raw_dataset):
+_CIFAR10_GREYSCALE_WEIGHTS = torch.tensor([0.299, 0.587, 0.114])
+
+
+def get_dataset_metadata(dataset_name):
+    if dataset_name not in DATASET_METADATA:
+        raise ValueError(
+            f"dataset must be one of {sorted(DATASET_METADATA)}, got {dataset_name!r}"
+        )
+    return dict(DATASET_METADATA[dataset_name])
+
+
+def _mnist_to_flat_tensors(raw_dataset):
     """Vectorized ToTensor + flatten over the whole dataset (done once)."""
     x = raw_dataset.data.float().div_(255.0).flatten(1)
     y = torch.as_tensor(raw_dataset.targets, dtype=torch.long)
     return x, y
+
+
+def _cifar10_greyscale_to_flat_tensors(raw_dataset):
+    """Convert CIFAR-10 RGB images to greyscale and flatten."""
+    x = torch.from_numpy(raw_dataset.data).float().div_(255.0)
+    x = x.matmul(_CIFAR10_GREYSCALE_WEIGHTS)
+    x = x.flatten(1)
+    y = torch.as_tensor(raw_dataset.targets, dtype=torch.long)
+    return x, y
+
+
+def _dataset_to_flat_tensors(raw_dataset, dataset_name):
+    if dataset_name in ("fashion_mnist", "kmnist"):
+        return _mnist_to_flat_tensors(raw_dataset)
+    if dataset_name == "cifar10":
+        return _cifar10_greyscale_to_flat_tensors(raw_dataset)
+    raise ValueError(
+        f"dataset must be one of {sorted(SUPPORTED_DATASETS)}, got {dataset_name!r}"
+    )
 
 
 def build_dataloaders(dataset_name, batch_size, train_frac=0.8, seed=SEED):
@@ -35,12 +71,15 @@ def build_dataloaders(dataset_name, batch_size, train_frac=0.8, seed=SEED):
         )
 
     dataset_cls = SUPPORTED_DATASETS[dataset_name]
+    expected_input_dim = DATASET_METADATA[dataset_name]["input_dim"]
 
     training_data_raw = dataset_cls(root=DATASET_ROOT, train=True, download=True)
     test_data_raw = dataset_cls(root=DATASET_ROOT, train=False, download=True)
 
-    x_all, y_all = _dataset_to_flat_tensors(training_data_raw)
-    x_test, y_test = _dataset_to_flat_tensors(test_data_raw)
+    x_all, y_all = _dataset_to_flat_tensors(training_data_raw, dataset_name)
+    x_test, y_test = _dataset_to_flat_tensors(test_data_raw, dataset_name)
+    assert x_all.shape[1] == expected_input_dim
+    assert x_test.shape[1] == expected_input_dim
 
     train_size = int(train_frac * len(training_data_raw))
     val_size = len(training_data_raw) - train_size

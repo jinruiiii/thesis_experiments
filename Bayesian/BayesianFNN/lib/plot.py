@@ -145,6 +145,7 @@ def plot_param_count(
     legend_fontsize=None,
     ylim=None,
     yoffset_fontsize=None,
+    checkpoint_tail_epochs=None,
 ):
     base = Path(save_path)
     rows = []
@@ -175,10 +176,23 @@ def plot_param_count(
 
             run_id = int(run_dir.name.split("_", 1)[1])
             summary = pd.read_csv(summary_path)
-            best_epoch = int(summary.iloc[0]["Selected epoch"])
             metrics_df = pd.read_csv(metrics_path)
 
+            best_epoch = None
+            if "Selected epoch" in summary.columns:
+                try:
+                    best_epoch = int(summary.iloc[0]["Selected epoch"])
+                except (ValueError, TypeError):
+                    best_epoch = None
+
+            max_epoch = None
+            if checkpoint_tail_epochs is not None and best_epoch is not None:
+                max_epoch = best_epoch + int(checkpoint_tail_epochs)
+
             for _, mrow in metrics_df.iterrows():
+                epoch = int(mrow["epoch"])
+                if max_epoch is not None and epoch > max_epoch:
+                    continue
                 rows.append(
                     {
                         "run": run_id,
@@ -186,10 +200,13 @@ def plot_param_count(
                         "experiment": experiment,
                         "experiment_label": legend_label,
                         "junctures_mode": meta.get("junctures_mode"),
-                        "epoch": int(mrow["epoch"]),
+                        "epoch": epoch,
                         "param_count": float(mrow["param_count"]),
                     }
                 )
+
+            if best_epoch is None:
+                continue
 
             best_rows = metrics_df.loc[metrics_df["epoch"] == best_epoch]
             if not best_rows.empty:
@@ -1209,8 +1226,15 @@ def _nest_floor_color_map(df, palette=None):
         .unique()
     )
     if palette is None:
-        # Prefer a warm / distinct range from plasticity λ tab10 blues/reds.
-        palette = list(plt.cm.Dark2.colors) + list(plt.cm.Set1.colors)
+        # Purple/pink family — distinct from plasticity λ (tab10) and baseline black.
+        palette = [
+            "#d946ef",
+            "#c084fc",
+            "#f472b6",
+            "#e879f9",
+            "#a855f7",
+            "#ec4899",
+        ]
     return {floor: palette[i % len(palette)] for i, floor in enumerate(floors)}
 
 
@@ -1292,7 +1316,7 @@ def _point_style(
             "linewidth": 1.0,
         }
     if kind == "nest":
-        style = style_map.get("nest", {"color": "#8B4513", "marker": "v"})
+        style = style_map.get("nest", {"color": "#d946ef", "marker": "v"})
         floor = row.get("nest_floor_acc")
         if (
             nest_floor_colors is not None
@@ -1311,7 +1335,7 @@ def _point_style(
             "linewidth": 0.4,
         }
     if kind == "nest_dense":
-        style = style_map.get("nest_dense", {"color": "#8B4513", "marker": "v"})
+        style = style_map.get("nest_dense", {"color": "#d946ef", "marker": "v"})
         floor = row.get("nest_floor_acc")
         if (
             nest_floor_colors is not None
@@ -1392,6 +1416,17 @@ def _scatter_point(ax, x, y, style, marker_size, alpha=0.9):
     )
 
 
+def _pareto_mean_point_style(row, style_map):
+    color = _pareto_color(row["kind"], style_map, row.get("junctures_mode"))
+    return {
+        "marker": "s",
+        "facecolor": color,
+        "edgecolor": "black",
+        "linewidth": 0.4,
+        "color": color,
+    }
+
+
 def _infer_pareto_y_goal(y_col, ylabel=None):
     text = f"{y_col} {ylabel or ''}".lower()
     if any(k in text for k in ("brier", "loss", "error", "nll", "mse", "rmse")):
@@ -1463,6 +1498,7 @@ _DEFAULT_JUNCTURES_PARETO_LINESTYLES = {
     "grow": ":",
     "both_gp": "-.",
 }
+_PARETO_PLASTICITY_PRUNE_COLOR = "#ff7f0e"
 
 
 def _init_width_pareto_colors(widths):
@@ -1494,13 +1530,23 @@ def _normalize_junctures_mode_for_pareto(mode):
     return mode if mode else "both"
 
 
+def _pareto_color(kind, style_map, junctures_mode=None):
+    mode = _normalize_junctures_mode_for_pareto(junctures_mode)
+    if kind in ("plasticity", "plasticity_three_phase") and mode == "prune":
+        return _PARETO_PLASTICITY_PRUNE_COLOR
+    return style_map.get(kind, style_map["other"])["color"]
+
+
 def _kind_display_name_for_pareto(kind):
     return {
-        "static_replay": "static replay",
-        "three_phase": "three-phase",
-        "plasticity_three_phase": "plasticity+three-phase",
-        "nest": "nest sparse",
-        "nest_dense": "nest dense",
+        "baseline": "Symmetric Baseline",
+        "static_replay": "Static Replay",
+        "three_phase": "Three-Phase",
+        "plasticity": "Plasticity",
+        "plasticity_three_phase": "Plasticity-Three-Phase",
+        "nest": "NeST Sparse",
+        "nest_dense": "NeST Dense",
+        "dropnet": "DropNet",
     }.get(kind, kind)
 
 
@@ -1522,11 +1568,11 @@ def _pareto_legend_label(kind, junctures_mode=None, init_width=None):
     if mode == "both":
         return f"{name} Pareto"
     if mode == "prune":
-        return f"{name} prune only Pareto"
+        return f"{name} Prune-Only Pareto"
     if mode == "grow":
-        return f"{name} grow only Pareto"
+        return f"{name} Grow-Only Pareto"
     if mode == "both_gp":
-        return f"{name} grow+prune combo Pareto"
+        return f"{name} Grow+Prune Combo Pareto"
     pretty = _junctures_mode_label(mode) or mode
     return f"{name} {pretty} Pareto"
 
@@ -1573,6 +1619,7 @@ def _draw_kind_pareto_frontiers(
     split_by_init_width=False,
     split_by_junctures_mode=False,
     init_width_colors=None,
+    style_map=None,
 ):
     """
     Draw one or more Pareto frontiers for a kind.
@@ -1609,10 +1656,15 @@ def _draw_kind_pareto_frontiers(
             ls = _resolve_pareto_linestyle(
                 linestyle, kind, junctures_mode=mode_label
             )
+            line_color = (
+                _pareto_color(kind, style_map, mode_label)
+                if style_map is not None
+                else color
+            )
             handle = _draw_pareto_frontier(
                 ax,
                 sub,
-                color=color,
+                color=line_color,
                 label=label,
                 y_goal=y_goal,
                 linestyle=ls,
@@ -1786,7 +1838,7 @@ def _legend_handles_for_test_acc_plot(
             )
     nest_df = df.loc[df["kind"] == "nest"]
     if not nest_df.empty:
-        nest_style = style_map.get("nest", {"color": "#8B4513", "marker": "v"})
+        nest_style = style_map.get("nest", {"color": "#d946ef", "marker": "v"})
         floors = sorted(nest_df["nest_floor_acc"].dropna().unique())
         if floors:
             for floor in floors:
@@ -1819,7 +1871,7 @@ def _legend_handles_for_test_acc_plot(
     nest_dense_df = df.loc[df["kind"] == "nest_dense"]
     if not nest_dense_df.empty:
         nest_dense_style = style_map.get(
-            "nest_dense", {"color": "#8B4513", "marker": "v"}
+            "nest_dense", {"color": "#d946ef", "marker": "v"}
         )
         floors = sorted(nest_dense_df["nest_floor_acc"].dropna().unique())
         if floors:
@@ -1927,6 +1979,7 @@ def plot_param_count_vs_test_acc(
     lambda_palette=None,
     style_by="junctures_mode",
     show_pareto_frontier=False,
+    show_points=True,
     pareto_scope="per_kind",
     pareto_y_goal=None,
     pareto_frontier_kinds=("baseline", "plasticity"),
@@ -1997,6 +2050,10 @@ def plot_param_count_vs_test_acc(
         Defaults to tab10 + Set2.
     show_pareto_frontier : bool
         If True, draw Pareto frontier line(s) (lower params; y direction auto-detected).
+    show_points : bool
+        If False, skip error bars and per-run scatter; when ``aggregate_runs=True``,
+        still plot one mean marker per experiment configuration. Requires
+        ``show_pareto_frontier=True`` (or mean markers) for a non-empty figure.
     pareto_scope : str
         "global" for one frontier over all points;
         "per_kind" for separate baseline/plasticity lines;
@@ -2074,8 +2131,8 @@ def plot_param_count_vs_test_acc(
             "plasticity_three_phase": {"color": "#9467bd", "marker": "P"},
             "plasticity": {"color": "#d62728", "marker": "o"},
             "static_replay": {"color": "#2ca02c", "marker": "X"},
-            "nest": {"color": "#8B4513", "marker": "v"},
-            "nest_dense": {"color": "#8B4513", "marker": "v"},
+            "nest": {"color": "#d946ef", "marker": "v"},
+            "nest_dense": {"color": "#d946ef", "marker": "v"},
             "dropnet": {"color": "#17becf", "marker": "^"},
             "other": {"color": "gray", "marker": "x"},
         }
@@ -2091,19 +2148,7 @@ def plot_param_count_vs_test_acc(
     dropnet_style_by_mode = len(dropnet_modes) > 1
     fig, ax = plt.subplots(figsize=figsize)
     grouped = None
-    if not aggregate_runs:
-        for _, row in df.iterrows():
-            style = _point_style(
-                row,
-                style_map,
-                lambda_colors,
-                style_by_junctures,
-                nest_floor_colors,
-                dropnet_kappa_colors,
-                dropnet_style_by_mode,
-            )
-            _scatter_point(ax, row["x"], row["y"], style, marker_size)
-    else:
+    if aggregate_runs:
         grouped = (
             df.groupby(group_by, dropna=False)
             .agg(
@@ -2124,38 +2169,65 @@ def plot_param_count_vs_test_acc(
             )
             .reset_index()
         )
-        for _, row in grouped.iterrows():
-            style = _point_style(
-                row,
-                style_map,
-                lambda_colors,
-                style_by_junctures,
-                nest_floor_colors,
-                dropnet_kappa_colors,
-                dropnet_style_by_mode,
-            )
-            ax.errorbar(
-                row["x_mean"], row["y_mean"],
-                xerr=row["x_std"] if pd.notna(row["x_std"]) else None,
-                yerr=row["y_std"] if pd.notna(row["y_std"]) else None,
-                fmt=style["marker"],
-                color=style["edgecolor"],
-                markerfacecolor=style["facecolor"],
-                markeredgecolor=style["edgecolor"],
-                markeredgewidth=style["linewidth"],
-                markersize=8,
-                capsize=3,
-                linestyle="none",
-                alpha=0.95,
-            )
-            if annotate_points:
-                ax.annotate(
-                    str(row[group_by]),
-                    (row["x_mean"], row["y_mean"]),
-                    textcoords="offset points",
-                    xytext=(4, 4),
-                    fontsize=8,
+        if show_points:
+            for _, row in grouped.iterrows():
+                style = _point_style(
+                    row,
+                    style_map,
+                    lambda_colors,
+                    style_by_junctures,
+                    nest_floor_colors,
+                    dropnet_kappa_colors,
+                    dropnet_style_by_mode,
                 )
+                ax.errorbar(
+                    row["x_mean"], row["y_mean"],
+                    xerr=row["x_std"] if pd.notna(row["x_std"]) else None,
+                    yerr=row["y_std"] if pd.notna(row["y_std"]) else None,
+                    fmt=style["marker"],
+                    color=style["edgecolor"],
+                    markerfacecolor=style["facecolor"],
+                    markeredgecolor=style["edgecolor"],
+                    markeredgewidth=style["linewidth"],
+                    markersize=8,
+                    capsize=3,
+                    linestyle="none",
+                    alpha=0.95,
+                )
+                if annotate_points:
+                    ax.annotate(
+                        str(row[group_by]),
+                        (row["x_mean"], row["y_mean"]),
+                        textcoords="offset points",
+                        xytext=(4, 4),
+                        fontsize=8,
+                    )
+            for _, row in df.iterrows():
+                style = _point_style(
+                    row,
+                    style_map,
+                    lambda_colors,
+                    style_by_junctures,
+                    nest_floor_colors,
+                    dropnet_kappa_colors,
+                    dropnet_style_by_mode,
+                )
+                _scatter_point(
+                    ax, row["x"], row["y"], style, marker_size * 0.5, alpha=alpha_individual
+                )
+        else:
+            for _, row in grouped.iterrows():
+                style = _pareto_mean_point_style(row, style_map)
+                _scatter_point(ax, row["x_mean"], row["y_mean"], style, marker_size)
+                if annotate_points:
+                    ax.annotate(
+                        str(row[group_by]),
+                        (row["x_mean"], row["y_mean"]),
+                        textcoords="offset points",
+                        xytext=(4, 4),
+                        fontsize=8,
+                    )
+    elif show_points:
         for _, row in df.iterrows():
             style = _point_style(
                 row,
@@ -2166,9 +2238,7 @@ def plot_param_count_vs_test_acc(
                 dropnet_kappa_colors,
                 dropnet_style_by_mode,
             )
-            _scatter_point(
-                ax, row["x"], row["y"], style, marker_size * 0.5, alpha=alpha_individual
-            )
+            _scatter_point(ax, row["x"], row["y"], style, marker_size)
 
     pareto_handles = []
     if show_pareto_frontier:
@@ -2194,8 +2264,8 @@ def plot_param_count_vs_test_acc(
             )["color"],
             "plasticity": style_map["plasticity"]["color"],
             "static_replay": style_map.get("static_replay", {"color": "#2ca02c"})["color"],
-            "nest": style_map.get("nest", {"color": "#8B4513"})["color"],
-            "nest_dense": style_map.get("nest_dense", {"color": "#8B4513"})["color"],
+            "nest": style_map.get("nest", {"color": "#d946ef"})["color"],
+            "nest_dense": style_map.get("nest_dense", {"color": "#d946ef"})["color"],
             "dropnet": style_map.get("dropnet", {"color": "#17becf"})["color"],
             "other": style_map["other"]["color"],
         }
@@ -2239,10 +2309,11 @@ def plot_param_count_vs_test_acc(
                         split_by_init_width=split_by_init_width,
                         split_by_junctures_mode=split_by_junctures_mode,
                         init_width_colors=width_colors,
+                        style_map=style_map,
                     )
                 )
 
-    if legend_mode == "full":
+    if legend_mode == "full" and (show_points or aggregate_runs):
         handles = _legend_handles_for_test_acc_plot(
             df,
             style_map,
@@ -2265,6 +2336,270 @@ def plot_param_count_vs_test_acc(
             legend_kwargs["fontsize"] = legend_fontsize
             legend_kwargs["title_fontsize"] = legend_fontsize
         ax.legend(**legend_kwargs)
+    ax.set_xlabel(xlabel, fontsize=axis_label_fontsize)
+    ax.set_ylabel(ylabel, fontsize=axis_label_fontsize)
+    if x_tick_interval is not None:
+        from matplotlib.ticker import MultipleLocator
+
+        ax.xaxis.set_major_locator(MultipleLocator(float(x_tick_interval)))
+    if tick_label_fontsize is not None:
+        ax.tick_params(axis="both", labelsize=tick_label_fontsize)
+    ax.set_title(title, fontsize=title_fontsize)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    if save_path_out is not None:
+        fig.savefig(save_path_out, dpi=dpi, bbox_inches="tight")
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+    return fig, ax, df
+
+
+def _parse_gamma_label_from_save_path(save_path):
+    """Extract a display label from a results root like ..._gamma0.01."""
+    name = Path(save_path).name
+    match = re.search(r"gamma([0-9.e-]+)", name, re.I)
+    if match:
+        return f"γ={match.group(1)}"
+    return name
+
+
+def _default_gamma_color_map(gamma_labels, gamma_colors=None):
+    """Assign a distinct color to each gamma label."""
+    if gamma_colors is not None:
+        return dict(gamma_colors)
+    cmap = plt.get_cmap("tab10")
+    return {label: cmap(i % 10) for i, label in enumerate(gamma_labels)}
+
+
+def plot_gamma_pareto_comparison(
+    save_paths,
+    gamma_labels=None,
+    experiments=None,
+    experiment_glob="*",
+    num_runs=5,
+    aggregate_runs=True,
+    x_col="Parameters",
+    y_col="Test Acc",
+    xlabel=None,
+    ylabel=None,
+    title=None,
+    save_path_out=None,
+    show=True,
+    figsize=(10, 7),
+    dpi=150,
+    pareto_frontier_kinds=("plasticity",),
+    show_points=True,
+    gamma_colors=None,
+    pareto_linestyle="--",
+    pareto_linewidth=1.5,
+    pareto_y_goal=None,
+    alpha_individual=0.35,
+    marker_size=70,
+    legend_mode="pareto",
+    in_features=784,
+    out_features=10,
+    axis_label_fontsize=None,
+    tick_label_fontsize=None,
+    title_fontsize=None,
+    legend_fontsize=None,
+    x_tick_interval=None,
+):
+    """
+    Compare plasticity Pareto frontiers across growth-rate (gamma) result folders.
+
+    Styling matches ``plot_param_count_vs_test_acc`` (errorbars, faint runs, Pareto lines).
+
+    Typical usage
+    -------------
+    plot_gamma_pareto_comparison(
+        save_paths=[
+            "results_fashionmnist_plasticity_gamma0.1",
+            "results_fashionmnist_plasticity_gamma0.01",
+        ],
+        experiments=[
+            "plasticity_500_0", "plasticity_500_1e-07", "plasticity_500_5e-07",
+            "plasticity_500_1e-06", "plasticity_500_5e-06",
+        ],
+        num_runs=5,
+        y_col="Test Acc",
+        save_path_out="results_fashionmnist_gamma_pareto_acc.png",
+        show=False,
+    )
+    """
+    if not save_paths:
+        raise ValueError("save_paths must be a non-empty list of result roots")
+    if legend_mode not in ("full", "pareto"):
+        raise ValueError(
+            f"legend_mode must be 'full' or 'pareto', got {legend_mode!r}"
+        )
+
+    save_paths = [Path(p) for p in save_paths]
+    if gamma_labels is None:
+        gamma_labels = [_parse_gamma_label_from_save_path(p) for p in save_paths]
+    if len(gamma_labels) != len(save_paths):
+        raise ValueError(
+            f"gamma_labels length ({len(gamma_labels)}) must match save_paths ({len(save_paths)})"
+        )
+
+    frames = []
+    for save_path, gamma_label in zip(save_paths, gamma_labels):
+        df = collect_experiment_summaries(
+            save_path=str(save_path),
+            experiments=experiments,
+            experiment_glob=experiment_glob,
+            num_runs=num_runs,
+            x_col=x_col,
+            y_col=y_col,
+            in_features=in_features,
+            out_features=out_features,
+        )
+        df = df.copy()
+        df["gamma_label"] = gamma_label
+        frames.append(df)
+    df = pd.concat(frames, ignore_index=True)
+
+    if xlabel is None:
+        if x_col in ("FLOPs", "FLOPs_realized", "FLOPs_theoretical"):
+            xlabel = "FLOPs"
+        elif x_col == "Sparse Parameters":
+            xlabel = "Sparse parameter count"
+        elif x_col == "Dense Parameters":
+            xlabel = "Dense parameter count"
+        else:
+            xlabel = "Parameter count"
+    if ylabel is None:
+        ylabel = y_col
+    if title is None:
+        title = f"{ylabel} vs parameter count by growth rate"
+
+    resolved_y_goal = pareto_y_goal or _infer_pareto_y_goal(y_col, ylabel)
+    color_map = _default_gamma_color_map(gamma_labels, gamma_colors=gamma_colors)
+    kinds = tuple(pareto_frontier_kinds)
+    resolved_pareto_linestyle = _resolve_pareto_linestyle(
+        pareto_linestyle, kind="plasticity", junctures_mode="both"
+    )
+
+    fig, ax = plt.subplots(figsize=figsize)
+    pareto_handles = []
+    grouped = None
+
+    if aggregate_runs:
+        grouped = (
+            df.groupby(["gamma_label", "experiment"], dropna=False)
+            .agg(
+                x_mean=("x", "mean"),
+                x_std=("x", "std"),
+                y_mean=("y", "mean"),
+                y_std=("y", "std"),
+                kind=("kind", "first"),
+                n_runs=("run", "nunique"),
+            )
+            .reset_index()
+        )
+        plot_source = grouped
+        x_plot_col, y_plot_col = "x_mean", "y_mean"
+    else:
+        plot_source = df
+        x_plot_col, y_plot_col = "x", "y"
+
+    if show_points and aggregate_runs and grouped is not None:
+        for _, row in grouped.iterrows():
+            if row["kind"] not in kinds:
+                continue
+            color = color_map[row["gamma_label"]]
+            ax.errorbar(
+                row["x_mean"],
+                row["y_mean"],
+                xerr=row["x_std"] if pd.notna(row["x_std"]) else None,
+                yerr=row["y_std"] if pd.notna(row["y_std"]) else None,
+                fmt="o",
+                color=color,
+                markerfacecolor=color,
+                markeredgecolor=color,
+                markeredgewidth=1.0,
+                markersize=8,
+                capsize=3,
+                linestyle="none",
+                alpha=0.95,
+                zorder=2,
+            )
+        for _, row in df.iterrows():
+            if row["kind"] not in kinds:
+                continue
+            color = color_map[row["gamma_label"]]
+            ax.scatter(
+                row["x"],
+                row["y"],
+                color=color,
+                alpha=alpha_individual,
+                s=marker_size * 0.5,
+                zorder=1,
+            )
+
+    for gamma_label in gamma_labels:
+        color = color_map[gamma_label]
+        subset = plot_source[
+            (plot_source["gamma_label"] == gamma_label)
+            & (plot_source["kind"].isin(kinds))
+        ]
+        if subset.empty:
+            continue
+
+        if show_points and not aggregate_runs:
+            ax.scatter(
+                subset[x_plot_col],
+                subset[y_plot_col],
+                color=color,
+                alpha=alpha_individual,
+                s=marker_size * 0.5,
+                zorder=2,
+            )
+
+        pareto_df = subset.rename(columns={x_plot_col: "x", y_plot_col: "y"})
+        handle = _draw_pareto_frontier(
+            ax,
+            pareto_df,
+            color=color,
+            label=f"{gamma_label} Pareto",
+            y_goal=resolved_y_goal,
+            linestyle=resolved_pareto_linestyle,
+            linewidth=pareto_linewidth,
+        )
+        if handle is not None:
+            pareto_handles.append(handle)
+
+    if legend_mode == "full":
+        point_handles = []
+        for gamma_label in gamma_labels:
+            if gamma_label not in df["gamma_label"].values:
+                continue
+            color = color_map[gamma_label]
+            point_handles.append(
+                Line2D(
+                    [0], [0],
+                    marker="o",
+                    color="w",
+                    markerfacecolor=color,
+                    markeredgecolor=color,
+                    markersize=8,
+                    label=gamma_label,
+                )
+            )
+        handles = point_handles + pareto_handles
+        legend_title = "Growth rate / Pareto"
+    else:
+        handles = list(pareto_handles)
+        legend_title = "Pareto"
+
+    if handles:
+        legend_kwargs = {"handles": handles, "title": legend_title}
+        if legend_fontsize is not None:
+            legend_kwargs["fontsize"] = legend_fontsize
+            legend_kwargs["title_fontsize"] = legend_fontsize
+        ax.legend(**legend_kwargs)
+
     ax.set_xlabel(xlabel, fontsize=axis_label_fontsize)
     ax.set_ylabel(ylabel, fontsize=axis_label_fontsize)
     if x_tick_interval is not None:

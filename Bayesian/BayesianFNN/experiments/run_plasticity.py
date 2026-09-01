@@ -8,7 +8,7 @@ import pandas as pd
 import torch
 import torch.optim as optim
 
-from lib.data import build_dataloaders
+from lib.data import SUPPORTED_DATASETS, build_dataloaders, get_dataset_metadata
 from lib.flops import dense_fnn_flops
 from lib.plot import _parse_experiment_dir_name, plot_metrics
 from lib.plasticity import (
@@ -262,7 +262,7 @@ def run_three_phase_baseline(
         test_acc=metrics["test_acc"],
         test_brier=metrics["test_brier"],
         lambda_penalty=lambda_penalty,
-        flops=dense_fnn_flops(784, metrics["hidden_sizes"], 10),
+        flops=dense_fnn_flops(model.in_features, metrics["hidden_sizes"], model.out_features),
         selected_checkpoint_metric=checkpoint_metric_label,
         junctures_mode=junctures_mode,
     )
@@ -514,7 +514,7 @@ def run_experiment(experiment_name, model, train_loader, val_loader, test_loader
         test_acc=metrics["test_acc"],
         test_brier=metrics["test_brier"],
         lambda_penalty=csv_lambda_penalty,
-        flops=dense_fnn_flops(784, metrics["hidden_sizes"], 10),
+        flops=dense_fnn_flops(model.in_features, metrics["hidden_sizes"], model.out_features),
         selected_checkpoint_metric=checkpoint_metric_label,
         junctures_mode=junctures_mode,
     )
@@ -904,7 +904,7 @@ def run_adaptive_experiment(
         test_acc=metrics["test_acc"],
         test_brier=metrics["test_brier"],
         lambda_penalty=lambda_penalty,
-        flops=dense_fnn_flops(784, metrics["hidden_sizes"], 10),
+        flops=dense_fnn_flops(model.in_features, metrics["hidden_sizes"], model.out_features),
         selected_checkpoint_metric=checkpoint_metric_label,
         junctures_mode=junctures_mode,
     )
@@ -948,14 +948,17 @@ def main(
     growth_layer_score="mad",
     growth_mad_percentile=90.0,
     decision_cooldown_epochs=50,
-    phase1_epochs=10,
-    phase2_epochs=10,
-    phase3_epochs=10,
+    phase1_epochs=20,
+    phase2_epochs=20,
+    phase3_epochs=50,
     three_phase_growth_layer_idx=1,
     three_phase_growth_gamma=1,
     resume_from_plasticity_dir=None,
     dataset="fashion_mnist",
     run_mode="plasticity",
+    warm_start_steps=64,
+    grow_new_only_steps=16,
+    gamma=0.0
 ):
     """
 
@@ -975,9 +978,16 @@ def main(
         raise ValueError(
             f"run_mode must be one of {sorted(allowed_run_modes)}, got {run_mode!r}"
         )
+    if dataset not in SUPPORTED_DATASETS:
+        raise ValueError(
+            f"dataset must be one of {sorted(SUPPORTED_DATASETS)}, got {dataset!r}"
+        )
+    dataset_meta = get_dataset_metadata(dataset)
+    input_dim = dataset_meta["input_dim"]
+    num_classes = dataset_meta["num_classes"]
     # Hyperparameters
-    num_epochs = 60
-    batch_size = 256
+    num_epochs = 60 if dataset == "fashion_mnist" else 90
+    batch_size = 256 if dataset == "fashion_mnist" else 128
     learning_rate = 0.005 if dataset == "fashion_mnist" else 0.001
     beta = 0.002
     decision_interval_min = 1
@@ -986,19 +996,17 @@ def main(
     decision_warmup_epochs = 0
     decision_cooldown_epochs = 0
 
-    gamma = 0.0
     rho = 0.1
     if three_phase_growth_gamma is None:
         three_phase_growth_gamma = gamma
-    # gamma = 0.10
-    # rho = 0.10
+
     prune_mode = "global_param"
     global_prune_budget = "neurons"  # "params" or "neurons"
     global_prune_normalize = "mad"  # "percentile", "zscore", "mad", or "raw"
 
-    warm_start_steps = 64
-    warm_start_lr = learning_rate * 0.4 if dataset == "fashion_mnist" else learning_rate
-    grow_new_only_steps = 16 if dataset == "fashion_mnist" else 32
+    # warm_start_steps = 64 #if dataset == "fashion_mnist" else 32
+    warm_start_lr = learning_rate * 0.4 
+    # grow_new_only_steps = 16 #if dataset == "fashion_mnist" else 8
     
     # Create results directory
     os.makedirs(f'{save_path}', exist_ok=True)
@@ -1017,7 +1025,7 @@ def main(
         print("\n\n" + "="*50)
         print("Training Baseline Model")
         print("="*50)
-        baseline_model = BayesianFNN(784, hidden_sizes, 10).to(device)
+        baseline_model = BayesianFNN(input_dim, hidden_sizes, num_classes).to(device)
         initial_state_dict = copy.deepcopy(baseline_model.state_dict())
         baseline_output_dir = os.path.join(save_path, f'baseline_{hidden_sizes[0]}')
         baseline_metrics, _, _= run_experiment(
@@ -1069,7 +1077,7 @@ def main(
             },
         )
 
-        static_model = BayesianFNN(784, replay_hidden_sizes, 10).to(device)
+        static_model = BayesianFNN(input_dim, replay_hidden_sizes, num_classes).to(device)
         run_experiment(
             "static_replay",
             static_model,
@@ -1089,7 +1097,7 @@ def main(
 
 
     if run_mode in ("three_phase"):
-        three_phase_model = BayesianFNN(784, hidden_sizes, 10).to(device)
+        three_phase_model = BayesianFNN(input_dim, hidden_sizes, num_classes).to(device)
         three_phase_output_dir = os.path.join(
             save_path,
             f'three_phase_baseline_{hidden_sizes[0]}',
@@ -1119,7 +1127,7 @@ def main(
         plasticity_output_dir = os.path.join(
             save_path, f"plasticity_{hidden_sizes[0]}_{lam_tag}{suffix}"
         )
-        base_model = BayesianFNN(784, hidden_sizes, 10).to(device)
+        base_model = BayesianFNN(input_dim, hidden_sizes, num_classes).to(device)
         run_adaptive_experiment(
             "plasticity",
             base_model,

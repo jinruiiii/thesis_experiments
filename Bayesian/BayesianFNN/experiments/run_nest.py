@@ -11,7 +11,7 @@ import torch
 import torch.optim as optim
 from tqdm import tqdm
 
-from lib.data import SUPPORTED_DATASETS, build_dataloaders
+from lib.data import SUPPORTED_DATASETS, build_dataloaders, get_dataset_metadata
 from lib.flops import theoretical_sparse_fnn_flops
 from lib.seed import SEED, device, set_seed
 from lib.train import ensure_output_dir, loss_function
@@ -23,10 +23,6 @@ from models.sparse_bayesian_fnn import (
     neuron_growth_step,
     snr_prune_step,
 )
-
-INPUT_DIM = 784
-NUM_CLASSES = 10
-
 
 def write_nest_experiment_summary_csv(
     output_dir,
@@ -468,7 +464,7 @@ def main(
     seed_scale=1.0,
     learning_rate=None,
     beta=0.002,
-    batch_size=256,
+    batch_size=None,
     reference_acc=90.0,
     prune_acc_floor=None,
     max_growth_epochs=40,
@@ -485,13 +481,23 @@ def main(
     dataset options:
       - "fashion_mnist": Fashion-MNIST (default)
       - "kmnist": Kuzushiji-MNIST
+      - "cifar10": CIFAR-10 greyscale (1024-dim input)
+
+    When using cifar10, set reference_acc and prune_acc_floor to values
+    appropriate for that dataset (Fashion-MNIST thresholds like 89% will not
+    work sensibly).
     """
     if dataset not in SUPPORTED_DATASETS:
         raise ValueError(
             f"dataset must be one of {sorted(SUPPORTED_DATASETS)}, got {dataset!r}"
         )
+    dataset_meta = get_dataset_metadata(dataset)
+    input_dim = dataset_meta["input_dim"]
+    num_classes = dataset_meta["num_classes"]
     if learning_rate is None:
         learning_rate = 0.005 if dataset == "fashion_mnist" else 0.001
+    if batch_size is None:
+        batch_size = 256 if dataset == "fashion_mnist" else 128
 
     h = [max(1, int(round(w * seed_scale))) for w in hidden_sizes]
     if len(h) != 2:
@@ -508,7 +514,7 @@ def main(
         f"test={len(test_loader.dataset):,})"
     )
 
-    model = SparseBayesianFNN(INPUT_DIM, h, NUM_CLASSES).to(device)
+    model = SparseBayesianFNN(input_dim, h, num_classes).to(device)
     g = torch.Generator()
     g.manual_seed(SEED)
     init_seed_masks(model, activate_frac=seed_activate_frac, generator=g)
@@ -542,6 +548,8 @@ def main(
         json.dump(
             {
                 "dataset": dataset,
+                "input_dim": int(input_dim),
+                "num_classes": int(num_classes),
                 "seed_hidden_sizes": h,
                 "seed_activate_frac": float(seed_activate_frac),
                 "reference_acc": float(reference_acc),
@@ -578,15 +586,37 @@ def main(
 
 if __name__ == "__main__":
 
-    for prune_acc_floor in [89.0, 88.5, 88.0, 87.5, 87.0]:
+    # for prune_acc_floor in [89.0, 88.5, 88.0, 87.5, 87.0]:
+    #     for i in range(1, 6):
+    #         set_seed(SEED + i)
+    #         main(
+    #             f"results_fashionmnist/run_{i}",
+    #             hidden_sizes=(300, 100),
+    #             dataset="fashion_mnist",
+    #             seed_scale=1,
+    #             seed_activate_frac=0.1,
+    #             reference_acc=89.0,
+    #             prune_acc_floor=prune_acc_floor,
+    #             max_growth_epochs=60,
+    #             grow_interval=2,
+    #             conn_grow_frac=0.01,
+    #             beta_growth=0.4,
+    #             birth_strength=0.4,
+    #             prune_frac=0.01,
+    #             max_prune_rounds=200,
+    #             prune_retrain_epochs=2,
+    #         )
+
+    for prune_acc_floor in [44.0, 43.5, 43.0, 42.5, 42.0]:
         for i in range(1, 6):
             set_seed(SEED + i)
             main(
-                f"results_fashionmnist/run_{i}",
+                f"results_cifar10_plasticity_0.1_ws64_gn32/run_{i}",
                 hidden_sizes=(300, 100),
+                dataset="cifar10",
                 seed_scale=1,
                 seed_activate_frac=0.1,
-                reference_acc=89.0,
+                reference_acc=44.0,
                 prune_acc_floor=prune_acc_floor,
                 max_growth_epochs=60,
                 grow_interval=2,
@@ -594,7 +624,8 @@ if __name__ == "__main__":
                 beta_growth=0.4,
                 birth_strength=0.4,
                 prune_frac=0.01,
-                max_prune_rounds=200,
+                max_prune_rounds=500,
                 prune_retrain_epochs=2,
             )
+
 
