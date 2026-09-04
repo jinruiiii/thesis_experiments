@@ -1,8 +1,8 @@
 """
-Fashion-MNIST prior-shift experiment (class-proportion flip).
+CIFAR-10 prior-shift experiment (class-proportion flip).
 
-Phase 1 train/val: ~90% on group A (Trouser, Sandal, Sneaker, Bag, Ankle boot),
-                   ~10% on group B (T-shirt, Pullover, Dress, Coat, Shirt).
+Phase 1 train/val: ~90% on group A (vehicles: airplane, automobile, ship, truck),
+                   ~10% on group B (animals).
 Phase 2: proportions swapped.
 
 Protocol:
@@ -10,8 +10,8 @@ Protocol:
   - Select best Phase-1 checkpoint on Phase-1-matched val.
   - Rewind to that checkpoint, switch loaders, continue Phase 2.
   - Optional (phase2_vcl_prior): freeze Phase-1 posterior as the KL prior for Phase 2.
-  - Optional (phase2_regrow_to_init): expand hidden layers back to the original
-    init widths before Phase-2 training (copy old weights; new neurons random).
+  - Optional (phase2_regrow_to_init): expand conv layers back to the original
+    init channel widths before Phase-2 training (copy old weights; new filters random).
   - Select best Phase-2 checkpoint on Phase-2-matched val for final eval.
   - Report balanced-test, Phase-2-matched, and Phase-1-matched (@P1/@P2) metrics for forgetting.
 
@@ -36,16 +36,22 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 
 from experiments.run_plasticity import (
+    _conv_channels_tag,
     _experiment_dir_suffix,
     _format_lambda_dir,
-    _parse_hidden_sizes_from_summary,
+    _make_eval_model,
+    _parse_conv_channels_from_summary,
     _resolve_plasticity_dir_for_static_replay,
     _static_replay_output_dir,
     write_static_replay_provenance,
 )
-from lib.flops import dense_fnn_flops
+from lib.data import DATASET_ROOT, get_dataset_input_spec, _dataset_to_tensors
 from lib.plot import _parse_experiment_dir_name
-from lib.plasticity import expand_and_load_encoder_layer, structural_decision_juncture
+from lib.plasticity import (
+    _conv_channels_from_model,
+    expand_and_load_conv_stack,
+    structural_decision_juncture,
+)
 from lib.seed import SEED, device
 from lib.train import (
     _checkpoint_metric_label,
@@ -54,38 +60,29 @@ from lib.train import (
     _val_score_for_checkpoint,
     count_params,
     ensure_output_dir,
-    load_checkpoint,
     save_checkpoint,
     train,
     validate,
 )
-from models.bayesian_fnn import BayesianFNN
+from models.bayesian_cnn import BayesianCNN
 from torchvision import datasets
 
-INPUT_DIM = 784
 NUM_CLASSES = 10
-DATASET_ROOT = "../../Datasets"
 
-GROUP_A = (1, 5, 7, 8, 9) 
-GROUP_B = (0, 2, 3, 4, 6)   
+GROUP_A = (0, 1, 8, 9)  # vehicles
+GROUP_B = (2, 3, 4, 5, 6, 7)  # animals
 CLASS_NAMES = (
-    "T-shirt/top",
-    "Trouser",
-    "Pullover",
-    "Dress",
-    "Coat",
-    "Sandal",
-    "Shirt",
-    "Sneaker",
-    "Bag",
-    "Ankle boot",
+    "airplane",
+    "automobile",
+    "bird",
+    "cat",
+    "deer",
+    "dog",
+    "frog",
+    "horse",
+    "ship",
+    "truck",
 )
-
-
-def _dataset_to_flat_tensors(raw_dataset):
-    x = raw_dataset.data.float().div_(255.0).flatten(1)
-    y = torch.as_tensor(raw_dataset.targets, dtype=torch.long)
-    return x, y
 
 
 def _make_loader(dataset, batch_size, shuffle, seed):
@@ -241,25 +238,31 @@ def evaluate_group_accuracy(model, dataloader, group_a=GROUP_A, group_b=GROUP_B)
 
 
 def build_prior_shift_dataloaders(
-    batch_size=256,
+    batch_size=64,
     train_frac=0.8,
     majority_frac=0.9,
     seed=SEED,
     group_a=GROUP_A,
     group_b=GROUP_B,
+    cifar10_grayscale=True,
 ):
     """
-    Build Phase-1 / Phase-2 prior-shifted Fashion-MNIST loaders plus balanced,
+    Build Phase-1 / Phase-2 prior-shifted CIFAR-10 loaders plus balanced,
     Phase-1-matched (majority A), and Phase-2-matched (majority B) held-out tests.
 
     Train/val are split first on the official training set, then each split is
     subsampled independently so Phase-1 and Phase-2 share no leaked indices beyond
     the original train/val partition.
     """
-    raw_train = datasets.FashionMNIST(root=DATASET_ROOT, train=True, download=True)
-    raw_test = datasets.FashionMNIST(root=DATASET_ROOT, train=False, download=True)
-    x_all, y_all = _dataset_to_flat_tensors(raw_train)
-    x_test, y_test = _dataset_to_flat_tensors(raw_test)
+    cfg = get_dataset_input_spec("cifar10", cifar10_grayscale=cifar10_grayscale)
+    raw_train = datasets.CIFAR10(root=DATASET_ROOT, train=True, download=True)
+    raw_test = datasets.CIFAR10(root=DATASET_ROOT, train=False, download=True)
+    x_all, y_all = _dataset_to_tensors(
+        raw_train, "cifar10", cfg["mean"], cfg["std"], cifar10_grayscale=cifar10_grayscale
+    )
+    x_test, y_test = _dataset_to_tensors(
+        raw_test, "cifar10", cfg["mean"], cfg["std"], cifar10_grayscale=cifar10_grayscale
+    )
 
     n = len(raw_train)
     train_size = int(train_frac * n)
@@ -397,7 +400,7 @@ def write_shift_summary_csv(
     model_label,
     params,
     trainable_params,
-    hidden_sizes,
+    conv_channels,
     best_phase1_epoch,
     best_phase2_epoch,
     best_phase2_val_total,
@@ -432,7 +435,6 @@ def write_shift_summary_csv(
     lambda_penalty,
     phase1_epochs,
     phase2_epochs,
-    flops,
     junctures_mode="both",
     selected_checkpoint_metric="phase2_val_total",
     run_mode="plasticity",
@@ -472,8 +474,7 @@ def write_shift_summary_csv(
         "Phase1 Matched @P2 Group B Brier": float(phase1_matched_at_p2_group_b_brier),
         "Phase1 Matched Forget Acc": float(phase1_matched_forget_acc),
         "Phase1 Matched Forget Group A Acc": float(phase1_matched_forget_group_a_acc),
-        "Hidden Sizes": str(list(hidden_sizes)),
-        "FLOPs": int(flops),
+        "Conv Channels": str(list(conv_channels)),
         "Lambda Penalty": float(lambda_penalty),
         "Junctures Mode": str(junctures_mode),
         "Phase 1 Epochs": int(phase1_epochs),
@@ -554,31 +555,41 @@ def _phase2_juncture_start_epoch(phase1_epochs, phase2_juncture_warmup_epochs):
     return phase1_epochs + max(0, int(phase2_juncture_warmup_epochs)) + 1
 
 
-def regrow_model_to_target(model, target_hidden_sizes):
-    target = [int(w) for w in target_hidden_sizes]
-    current = [layer.mu_w.shape[0] for layer in model.layers]
+def regrow_conv_model_to_target(model, target_conv_channels, fc_hidden=None, in_channels=None):
+    target = [int(c) for c in target_conv_channels]
+    current = _conv_channels_from_model(model)
     if len(target) != len(current):
         raise ValueError(
-            f"target_hidden_sizes length {len(target)} != model depth {len(current)}"
+            f"target_conv_channels length {len(target)} != model depth {len(current)}"
         )
     for i, (cur, tgt) in enumerate(zip(current, target)):
         if tgt < cur:
             raise ValueError(
-                f"Cannot regrow layer {i}: target width {tgt} < current width {cur}"
+                f"Cannot regrow layer {i}: target channels {tgt} < current channels {cur}"
             )
     if target == current:
         return model, current
 
     model_device = next(model.parameters()).device
-    grown = BayesianFNN(model.in_features, target, model.out_features).to(model_device)
-    expand_and_load_encoder_layer(model.state_dict(), grown)
+    grown = BayesianCNN(
+        in_channels if in_channels is not None else model.in_channels,
+        target,
+        model.num_classes,
+        kernel_size=model.kernel_size,
+        padding=model.padding,
+        stride=model.stride,
+        fc_hidden=fc_hidden if fc_hidden is not None else model.fc_hidden,
+    ).to(model_device)
+    expand_and_load_conv_stack(model.state_dict(), grown)
     return grown, target
 
 
 def run_prior_shift_experiment(
     experiment_name,
     model,
-    hidden_sizes,
+    conv_channels,
+    fc_hidden,
+    in_channels,
     loaders,
     phase1_epochs,
     phase2_epochs,
@@ -603,27 +614,27 @@ def run_prior_shift_experiment(
     phase2_only_junctures=False,
     phase2_juncture_warmup_epochs=None,
     prune_mode="global_param",
-    global_prune_budget="neurons",
+    global_prune_budget="filters",
     global_prune_normalize="mad",
     checkpoint_metric="val_loss_total",
     enable_structural=True,
     run_mode="plasticity",
     shift_manifest=None,
-    initial_hidden_sizes=None,
+    initial_conv_channels=None,
     phase2_regrow_to_init=False,
-    phase2_vcl_prior=False,
+    phase2_vcl_prior=True,
     summary_lambda_penalty=None,
     grow_new_only_steps=None,
 ):
     """
-    Two-phase Fashion-MNIST prior-shift run.
+    Two-phase CIFAR-10 prior-shift run.
 
     At the Phase-1 -> Phase-2 boundary the model is rewound to the best Phase-1
     validation checkpoint before continuing on the flipped prior.
     If phase2_vcl_prior is True, the Phase-1 posterior is frozen as the KL prior
     (VCL-style) before optional regrow / Phase-2 training.
-    If phase2_regrow_to_init is True, every hidden layer is then expanded back to
-    initial_hidden_sizes (original init widths) before Phase-2 training.
+    If phase2_regrow_to_init is True, every conv layer is then expanded back to
+    initial_conv_channels (original init channel widths) before Phase-2 training.
     phase2_juncture_warmup_epochs=K defers all grow/prune until epoch
     (phase1_epochs + K + 1), i.e. the first K Phase-2 epochs are weight-only.
     Final evaluation uses the best Phase-2 validation checkpoint on balanced and
@@ -647,10 +658,10 @@ def run_prior_shift_experiment(
     if shift_manifest is not None:
         write_shift_manifest(output_dir, shift_manifest)
 
-    if initial_hidden_sizes is None:
-        initial_hidden_sizes = list(hidden_sizes)
+    if initial_conv_channels is None:
+        initial_conv_channels = list(conv_channels)
     else:
-        initial_hidden_sizes = [int(w) for w in initial_hidden_sizes]
+        initial_conv_channels = [int(w) for w in initial_conv_channels]
     phase2_regrow_to_init = bool(phase2_regrow_to_init)
     phase2_vcl_prior = bool(phase2_vcl_prior)
 
@@ -725,7 +736,7 @@ def run_prior_shift_experiment(
         "structural_delta_prune": [],
         "structural_L_before": [],
         "structural_L_after_none": [],
-        "structural_hidden_sizes": [],
+        "structural_conv_channels": [],
         "structural_prune_mode": [],
         "structural_prune_target_remove": [],
         "structural_prune_params_removed": [],
@@ -739,9 +750,9 @@ def run_prior_shift_experiment(
         "phase2_epochs": phase2_epochs,
         "rewound_to_phase1_best_epoch": None,
         "phase2_regrew_to_init": False,
-        "phase2_hidden_sizes_before_regrow": None,
-        "phase2_hidden_sizes_after_regrow": None,
-        "initial_hidden_sizes": list(initial_hidden_sizes),
+        "phase2_conv_channels_before_regrow": None,
+        "phase2_conv_channels_after_regrow": None,
+        "initial_conv_channels": list(initial_conv_channels),
         "phase2_vcl_prior_applied": False,
     }
 
@@ -751,13 +762,13 @@ def run_prior_shift_experiment(
     best_p1_score = float("inf")
     best_p1_epoch = 0
     best_p1_state = None
-    best_p1_hidden = list(hidden_sizes)
+    best_p1_conv_channels = list(conv_channels)
 
     # Phase-2 best (for final eval)
     best_p2_score = float("inf")
     best_p2_epoch = 0
     best_p2_state = None
-    best_p2_hidden = list(hidden_sizes)
+    best_p2_conv_channels = list(conv_channels)
     best_p2_val_acc = 0.0
     best_p2_val_brier = float("inf")
 
@@ -805,18 +816,19 @@ def run_prior_shift_experiment(
             save_checkpoint(
                 os.path.join(output_dir, "phase1_end_checkpoint.pth"),
                 state_dict=copy.deepcopy(model.state_dict()),
+                model=model,
                 epoch=phase1_epochs,
-                hidden_sizes=[layer.mu_w.shape[0] for layer in model.layers],
+                conv_channels=_conv_channels_from_model(model),
                 selection_metric="phase1_end",
             )
 
-            model = BayesianFNN(INPUT_DIM, list(best_p1_hidden), NUM_CLASSES).to(device)
+            model = _make_eval_model(model, list(best_p1_conv_channels)).to(device)
             model.load_state_dict(best_p1_state, strict=True)
-            hidden_sizes = list(best_p1_hidden)
+            conv_channels = list(best_p1_conv_channels)
             metrics["rewound_to_phase1_best_epoch"] = int(best_p1_epoch)
             print(
                 f"Rewound to Phase-1 best epoch {best_p1_epoch} "
-                f"(hidden_sizes={hidden_sizes})"
+                f"(conv_channels={conv_channels})"
             )
 
             if phase2_vcl_prior:
@@ -829,26 +841,30 @@ def run_prior_shift_experiment(
                 save_checkpoint(
                     os.path.join(output_dir, "phase2_vcl_prior_checkpoint.pth"),
                     state_dict=copy.deepcopy(model.state_dict()),
+                    model=model,
                     epoch=best_p1_epoch,
-                    hidden_sizes=list(hidden_sizes),
+                    conv_channels=list(conv_channels),
                     selection_metric="phase2_vcl_prior",
                 )
 
             if phase2_regrow_to_init:
-                sizes_before = list(hidden_sizes)
-                model, hidden_sizes = regrow_model_to_target(model, initial_hidden_sizes)
+                sizes_before = list(conv_channels)
+                model, conv_channels = regrow_conv_model_to_target(
+                    model, initial_conv_channels, fc_hidden=fc_hidden, in_channels=in_channels
+                )
                 metrics["phase2_regrew_to_init"] = True
-                metrics["phase2_hidden_sizes_before_regrow"] = sizes_before
-                metrics["phase2_hidden_sizes_after_regrow"] = list(hidden_sizes)
+                metrics["phase2_conv_channels_before_regrow"] = sizes_before
+                metrics["phase2_conv_channels_after_regrow"] = list(conv_channels)
                 print(
-                    f"Phase-2 regrow to init: {sizes_before} -> {hidden_sizes} "
+                    f"Phase-2 regrow to init: {sizes_before} -> {conv_channels} "
                     f"(params={count_params(model):,})"
                 )
                 save_checkpoint(
                     os.path.join(output_dir, "phase2_regrown_checkpoint.pth"),
                     state_dict=copy.deepcopy(model.state_dict()),
+                    model=model,
                     epoch=phase1_epochs,
-                    hidden_sizes=list(hidden_sizes),
+                    conv_channels=list(conv_channels),
                     selection_metric="phase2_regrow_to_init",
                 )
 
@@ -919,13 +935,14 @@ def run_prior_shift_experiment(
         if phase_id == 1 and _is_better_checkpoint_score(val_score, best_p1_score, checkpoint_metric):
             best_p1_score = val_score
             best_p1_epoch = epoch
-            best_p1_hidden = [layer.mu_w.shape[0] for layer in model.layers]
+            best_p1_conv_channels = _conv_channels_from_model(model)
             best_p1_state = copy.deepcopy(model.state_dict())
             save_checkpoint(
                 os.path.join(output_dir, "phase1_best_checkpoint.pth"),
                 state_dict=best_p1_state,
+                model=model,
                 epoch=best_p1_epoch,
-                hidden_sizes=best_p1_hidden,
+                conv_channels=best_p1_conv_channels,
                 selection_metric=_checkpoint_metric_label(checkpoint_metric, phase2=False),
                 selection_value=best_p1_score,
             )
@@ -933,15 +950,16 @@ def run_prior_shift_experiment(
         if phase_id == 2 and _is_better_checkpoint_score(val_score, best_p2_score, checkpoint_metric):
             best_p2_score = val_score
             best_p2_epoch = epoch
-            best_p2_hidden = [layer.mu_w.shape[0] for layer in model.layers]
+            best_p2_conv_channels = _conv_channels_from_model(model)
             best_p2_val_acc = val_acc
             best_p2_val_brier = val_brier
             best_p2_state = copy.deepcopy(model.state_dict())
             save_checkpoint(
                 os.path.join(output_dir, "best_checkpoint.pth"),
                 state_dict=best_p2_state,
+                model=model,
                 epoch=best_p2_epoch,
-                hidden_sizes=best_p2_hidden,
+                conv_channels=best_p2_conv_channels,
                 selection_metric=checkpoint_metric_label,
                 selection_value=best_p2_score,
             )
@@ -959,9 +977,9 @@ def run_prior_shift_experiment(
                 exclude_layers = [i for i, rem in growth_cooldown.items() if rem > 0]
                 if exclude_layers:
                     print(f"Growth cooldown: excluding layer indices {exclude_layers} (0-based)")
-                action, model, hidden_sizes, info = structural_decision_juncture(
+                action, model, conv_channels, info = structural_decision_juncture(
                     model,
-                    hidden_sizes,
+                    conv_channels,
                     train_loader,
                     val_loader,
                     device,
@@ -988,7 +1006,7 @@ def run_prior_shift_experiment(
                 metrics["structural_delta_prune"].append(info.get("delta_prune"))
                 metrics["structural_L_before"].append(info.get("L_before"))
                 metrics["structural_L_after_none"].append(info.get("L_after_none"))
-                metrics["structural_hidden_sizes"].append(list(hidden_sizes))
+                metrics["structural_conv_channels"].append(list(conv_channels))
                 metrics["structural_prune_mode"].append(info.get("prune_mode"))
                 metrics["structural_prune_target_remove"].append(info.get("prune_target_remove"))
                 metrics["structural_prune_params_removed"].append(info.get("prune_params_removed"))
@@ -1028,11 +1046,11 @@ def run_prior_shift_experiment(
     )
 
     if best_p2_state is not None:
-        eval_model = BayesianFNN(INPUT_DIM, best_p2_hidden, NUM_CLASSES).to(device)
+        eval_model = _make_eval_model(model, best_p2_conv_channels).to(device)
         eval_model.load_state_dict(best_p2_state, strict=True)
         print(
             f"Loaded best Phase-2 model from epoch {best_p2_epoch} "
-            f"(val_acc={best_p2_val_acc:.2f}%, hidden_sizes={best_p2_hidden})"
+            f"(val_acc={best_p2_val_acc:.2f}%, conv_channels={best_p2_conv_channels})"
         )
     else:
         print("Warning: no Phase-2 checkpoint selected; using final training state.")
@@ -1045,7 +1063,7 @@ def run_prior_shift_experiment(
         )
         best_p2_val_acc = metrics["val_acc"][-1]
         best_p2_val_brier = metrics["val_brier"][-1]
-        best_p2_hidden = [layer.mu_w.shape[0] for layer in eval_model.layers]
+        best_p2_conv_channels = _conv_channels_from_model(eval_model)
 
     test_beta = (1 / len(loaders["balanced_test"].dataset)) * beta
     test_loss, test_acc, _, _, test_brier, _ = validate(
@@ -1063,7 +1081,7 @@ def run_prior_shift_experiment(
     p1_matched_beta = (1 / len(p1_matched_loader.dataset)) * beta
     if best_p1_state is None:
         raise RuntimeError("No Phase-1 checkpoint available for forgetting eval")
-    p1_eval_model = BayesianFNN(INPUT_DIM, list(best_p1_hidden), NUM_CLASSES).to(device)
+    p1_eval_model = _make_eval_model(model, list(best_p1_conv_channels)).to(device)
     p1_eval_model.load_state_dict(best_p1_state, strict=True)
     _, p1_matched_at_p1_acc, _, _, p1_matched_at_p1_brier, _ = validate(
         p1_eval_model, p1_matched_loader, device, p1_matched_beta, lambda_penalty
@@ -1105,12 +1123,13 @@ def run_prior_shift_experiment(
         f"forget Group A={p1_matched_forget_group_a_acc:.2f}pp"
     )
 
-    final_hidden_sizes = [layer.mu_w.shape[0] for layer in eval_model.layers]
+    final_conv_channels = _conv_channels_from_model(eval_model)
     save_checkpoint(
         os.path.join(output_dir, "final_checkpoint.pth"),
         state_dict=best_p2_state if best_p2_state is not None else eval_model.state_dict(),
+        model=eval_model,
         epoch=best_p2_epoch,
-        hidden_sizes=final_hidden_sizes,
+        conv_channels=final_conv_channels,
     )
 
     metrics.update({
@@ -1145,7 +1164,7 @@ def run_prior_shift_experiment(
         "phase1_matched_forget_group_a_acc": p1_matched_forget_group_a_acc,
         "param_count": count_params(eval_model),
         "trainable_param_count": eval_model.get_param_stats()["trainable_params"],
-        "hidden_sizes": final_hidden_sizes,
+        "conv_channels": final_conv_channels,
         "best_phase1_epoch": best_p1_epoch,
         "best_phase2_epoch": best_p2_epoch,
     })
@@ -1156,7 +1175,7 @@ def run_prior_shift_experiment(
         model_label=experiment_name,
         params=metrics["param_count"],
         trainable_params=metrics["trainable_param_count"],
-        hidden_sizes=metrics["hidden_sizes"],
+        conv_channels=metrics["conv_channels"],
         best_phase1_epoch=best_p1_epoch,
         best_phase2_epoch=best_p2_epoch,
         best_phase2_val_total=best_p2_score,
@@ -1191,7 +1210,6 @@ def run_prior_shift_experiment(
         lambda_penalty=csv_lambda_penalty,
         phase1_epochs=phase1_epochs,
         phase2_epochs=phase2_epochs,
-        flops=dense_fnn_flops(784, metrics["hidden_sizes"], 10),
         junctures_mode=junctures_mode,
         selected_checkpoint_metric=checkpoint_metric_label,
         run_mode=run_mode,
@@ -1215,7 +1233,7 @@ def run_prior_shift_experiment(
         "delta_prune": metrics["structural_delta_prune"],
         "L_before": metrics["structural_L_before"],
         "L_after_none": metrics["structural_L_after_none"],
-        "hidden_sizes": [str(hs) for hs in metrics["structural_hidden_sizes"]],
+        "conv_channels": [str(cc) for cc in metrics["structural_conv_channels"]],
         "junctures_mode": metrics["junctures_mode"],
         "prune_mode": metrics["structural_prune_mode"],
         "prune_target_remove": metrics["structural_prune_target_remove"],
@@ -1241,10 +1259,10 @@ def run_prior_shift_experiment(
         "phase2_vcl_prior_applied": bool(metrics["phase2_vcl_prior_applied"]),
         "phase2_juncture_warmup_epochs": int(phase2_juncture_warmup_epochs),
         "phase2_first_juncture_epoch": int(phase2_start) if enable_structural else None,
-        "initial_hidden_sizes": list(initial_hidden_sizes),
-        "phase2_hidden_sizes_before_regrow": metrics["phase2_hidden_sizes_before_regrow"],
-        "phase2_hidden_sizes_after_regrow": metrics["phase2_hidden_sizes_after_regrow"],
-        "final_hidden_sizes": final_hidden_sizes,
+        "initial_conv_channels": list(initial_conv_channels),
+        "phase2_conv_channels_before_regrow": metrics["phase2_conv_channels_before_regrow"],
+        "phase2_conv_channels_after_regrow": metrics["phase2_conv_channels_after_regrow"],
+        "final_conv_channels": final_conv_channels,
         "lambda_penalty": float(lambda_penalty),
         "enable_structural": bool(enable_structural),
         "junctures_mode": junctures_mode,
@@ -1269,7 +1287,7 @@ def run_prior_shift_experiment(
         f"Balanced test: {test_acc:.2f}% "
         f"(A={test_groups['group_a']:.2f}%, B={test_groups['group_b']:.2f}%)"
     )
-    print(f"Final hidden sizes: {final_hidden_sizes}")
+    print(f"Final conv channels: {final_conv_channels}")
     print(f"Structural decisions: {metrics['structural_actions']}")
 
     return metrics, model, total_epochs
@@ -1277,27 +1295,29 @@ def run_prior_shift_experiment(
 
 def main(
     save_path,
-    hidden_sizes,
+    conv_channels,
+    fc_hidden=128,
+    cifar10_grayscale=True,
     lambda_penalty=1e-6,
     run_mode="plasticity",
     junctures_mode="both",
     phase1_epochs=20,
     phase2_epochs=20,
-    batch_size=256,
-    learning_rate=0.005,
-    beta=0.002,
+    batch_size=64,
+    learning_rate=0.01,
+    beta=0.01,
     gamma=0.0,
     rho=0.1,
     warm_start_steps=32,
     grow_new_only_steps=None,
-    warm_start_lr=0.002,
+    warm_start_lr=0.004,
     decision_interval_min=1,
     decision_interval_max=1,
     decision_interval_power=1.0,
     phase2_only_junctures=False,
     phase2_juncture_warmup_epochs=0,
     prune_mode="global_param",
-    global_prune_budget="neurons",
+    global_prune_budget="filters",
     global_prune_normalize="mad",
     checkpoint_metric="val_loss_total",
     growth_layer_score="mad",
@@ -1305,7 +1325,7 @@ def main(
     majority_frac=0.9,
     resume_from_plasticity_dir=None,
     phase2_regrow_to_init=False,
-    phase2_vcl_prior=False,
+    phase2_vcl_prior=True,
 ):
     """
     run_mode:
@@ -1314,8 +1334,8 @@ def main(
       - "static_replay": fixed architecture from plasticity summary (same shift protocol)
 
     phase2_regrow_to_init:
-      If True (plasticity only), after Phase-1 rewind expand every hidden layer
-      back to the original init hidden_sizes before Phase-2 training.
+      If True (plasticity only), after Phase-1 rewind expand every conv layer
+      back to the original init conv channel widths before Phase-2 training.
     phase2_vcl_prior:
       If True (plasticity, baseline, or static_replay), after Phase-1 rewind
       freeze the Phase-1 posterior as the KL prior for Phase 2 (VCL-style).
@@ -1334,6 +1354,7 @@ def main(
         batch_size=batch_size,
         majority_frac=majority_frac,
         seed=SEED,
+        cifar10_grayscale=cifar10_grayscale,
     )
 
     print("\n" + "=" * 50)
@@ -1353,9 +1374,9 @@ def main(
 
     enable_structural = True
     summary_lambda = float(lambda_penalty)
-    model_hidden = list(hidden_sizes)
+    model_hidden = list(conv_channels)
     # Init widths for optional Phase-2 regrow (plasticity start size).
-    initial_hidden_sizes = list(hidden_sizes)
+    initial_conv_channels = list(conv_channels)
     # Only meaningful for plasticity; ignore for baseline / static_replay.
     use_phase2_regrow = bool(phase2_regrow_to_init) and run_mode == "plasticity"
     # VCL prior applies to plasticity, baseline, and static_replay (fair control).
@@ -1370,7 +1391,7 @@ def main(
         lambda_penalty = 0.0
         enable_structural = False
         experiment_name = "shift_baseline"
-        run_name = f"baseline_{hidden_sizes[0]}{vcl_tag}"
+        run_name = f"baseline_{_conv_channels_tag(conv_channels)}{vcl_tag}"
         output_dir = os.path.join(save_path, run_name)
     elif run_mode == "static_replay":
         if resume_from_plasticity_dir is None:
@@ -1378,7 +1399,7 @@ def main(
         plasticity_dir, summary_path = _resolve_plasticity_dir_for_static_replay(
             resume_from_plasticity_dir
         )
-        model_hidden = _parse_hidden_sizes_from_summary(summary_path)
+        model_hidden = _parse_conv_channels_from_summary(summary_path)
         source_meta = _parse_experiment_dir_name(os.path.basename(plasticity_dir))
         source_lambda = source_meta.get("lambda_penalty")
         if source_lambda is None:
@@ -1400,7 +1421,7 @@ def main(
         regrow_tag = "_regrow" if use_phase2_regrow else ""
         p2junct_tag = "_p2junct" if phase2_only_junctures else ""
         run_name = (
-            f"plasticity_{hidden_sizes[0]}_{_format_lambda_dir(lambda_penalty)}"
+            f"plasticity_{_conv_channels_tag(conv_channels)}_{_format_lambda_dir(lambda_penalty)}"
             f"{suffix}{regrow_tag}{p2junct_tag}{vcl_tag}"
         )
         output_dir = os.path.join(save_path, run_name)
@@ -1413,20 +1434,28 @@ def main(
             {
                 "source_plasticity_dir": plasticity_dir,
                 "source_summary_csv": summary_path,
-                "replayed_hidden_sizes": model_hidden,
+                "replayed_conv_channels": model_hidden,
                 "source_lambda_penalty": summary_lambda,
                 "training_lambda_penalty": 0.0,
-                "protocol": "fashion_mnist_prior_shift",
+                "protocol": "cifar10_prior_shift",
                 "phase2_vcl_prior": use_phase2_vcl,
             },
         )
 
-    model = BayesianFNN(INPUT_DIM, model_hidden, NUM_CLASSES).to(device)
+    in_spec = get_dataset_input_spec("cifar10", cifar10_grayscale=cifar10_grayscale)
+    model = BayesianCNN(
+        in_spec["in_channels"],
+        list(model_hidden),
+        NUM_CLASSES,
+        fc_hidden=fc_hidden,
+    ).to(device)
 
     return run_prior_shift_experiment(
         experiment_name,
         model,
         list(model_hidden),
+        fc_hidden,
+        in_spec["in_channels"],
         loaders,
         phase1_epochs=phase1_epochs,
         phase2_epochs=phase2_epochs,
@@ -1455,10 +1484,24 @@ def main(
         enable_structural=enable_structural,
         run_mode=run_mode,
         shift_manifest=manifest,
-        initial_hidden_sizes=initial_hidden_sizes,
+        initial_conv_channels=initial_conv_channels,
         phase2_regrow_to_init=use_phase2_regrow,
         phase2_vcl_prior=use_phase2_vcl,
         summary_lambda_penalty=summary_lambda if run_mode == "static_replay" else None,
         grow_new_only_steps=grow_new_only_steps,
     )
 
+
+
+if __name__ == "__main__":
+    from lib.seed import set_seed
+
+    for i in range(5):
+        set_seed(SEED + i)
+        main(
+            save_path=f"./results_prior_shift_cifar10/run_{i}",
+            conv_channels=[300, 300],
+            fc_hidden=128,
+            run_mode="plasticity",
+            phase2_vcl_prior=True,
+        )

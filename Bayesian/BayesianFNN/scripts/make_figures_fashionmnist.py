@@ -48,7 +48,7 @@ if __name__ == "__main__":
     ]
 
     _fashion_shift_experiments = [
-        "baseline_50_vcl", "baseline_100_vcl", "baseline_150_vcl", "baseline_200_vcl",
+        "baseline_20_vcl","baseline_50_vcl", "baseline_100_vcl", "baseline_150_vcl", "baseline_200_vcl",
         "plasticity_500_5e-06_vcl", "plasticity_500_1e-06_vcl", "plasticity_500_5e-07_vcl",
         "plasticity_500_1e-07_vcl", "plasticity_500_0_vcl",
         "static_replay_500_5e-06_vcl", "static_replay_500_1e-06_vcl",
@@ -159,6 +159,22 @@ if __name__ == "__main__":
         **_shift_pareto_plot_kwargs,
     )
 
+    plot_param_count_vs_test_acc(
+        experiments=_fashion_shift_experiments,
+        save_path_out="fashionmnist_plots/shift/shift_p1matched_at_p2_accuracy.pdf",
+        title="Phase-1 Matched Acc @P2 vs Parameter Count",
+        y_col="Phase1 Matched @P2 Acc",
+        ylabel="Phase1 Matched @P2 Acc",
+        **_shift_pareto_plot_kwargs,
+    )
+    plot_param_count_vs_test_acc(
+        experiments=_fashion_shift_experiments,
+        save_path_out="fashionmnist_plots/shift/shift_p1matched_at_p2_brier.pdf",
+        title="Phase-1 Matched Brier @P2 vs Parameter Count",
+        y_col="Phase1 Matched @P2 Brier",
+        ylabel="Phase1 Matched @P2 Brier",
+        **_shift_pareto_plot_kwargs,
+    )
     plot_param_count(
         save_path="results_fashionmnist",
         experiments=_experiments,

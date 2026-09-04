@@ -88,6 +88,19 @@ if __name__ == "__main__":
         "nest_300f_100f_p0.1_refacc71.5_flooracc71.5",
     ]
 
+    _cifar_shift_experiments = [
+        "baseline_30f_30f_vcl",
+        "baseline_40f_40f_vcl",
+        "baseline_60f_60f_vcl",
+        "baseline_80f_80f_vcl",
+        "baseline_100f_100f_vcl",
+        "plasticity_300f_300f_1e-07_vcl",
+        "plasticity_300f_300f_5e-07_vcl",
+        "plasticity_300f_300f_1e-06_vcl",
+        "plasticity_300f_300f_2.5e-06_vcl",
+        "plasticity_300f_300f_5e-06_vcl",
+    ]
+
     _cifar_pareto_kinds = (
         "baseline",
         "three_phase",
@@ -198,4 +211,44 @@ if __name__ == "__main__":
         legend_fontsize=16,
         ylabels="full",
         show=False,
+    )
+
+    _pareto_plot_kwargs = dict(
+        save_path="results_prior_shift_cifar10",
+        num_runs=5,
+        aggregate_runs=True,
+        show_pareto_frontier=True,
+        pareto_scope="per_junctures_mode",
+        pareto_frontier_kinds=_cifar_pareto_kinds,
+        x_col="Parameters",
+        xlabel="Parameter Count",
+        show=False,
+        legend_mode="pareto",
+        pareto_linewidth=5,
+        axis_label_fontsize=20,
+        tick_label_fontsize=20,
+        title_fontsize=20,
+        legend_fontsize=20,
+        nest_x_modes=("sparse"),
+        x_tick_interval=100_000,
+        show_points=False,
+        marker_size=120,
+    )
+
+    plot_param_count_vs_test_acc(
+        experiments=_cifar_shift_experiments,
+        save_path_out="cifar10_plots/shift/shift_accuracy.pdf",
+        title="Test Acc vs Parameter Count",
+        y_col="Test Acc",
+        ylabel="Test Acc",
+        **_pareto_plot_kwargs,
+    )
+
+    plot_param_count_vs_test_acc(
+        experiments=_cifar_shift_experiments,
+        save_path_out="cifar10_plots/shift/shift_brier.pdf",
+        title="Test Brier vs Parameter Count",
+        y_col="Test Brier",
+        ylabel="Test Brier",
+        **_pareto_plot_kwargs,
     )

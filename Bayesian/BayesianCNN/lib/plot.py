@@ -683,6 +683,28 @@ def _junctures_mode_label(mode):
     return mode
 
 
+_OPTIONAL_EXPERIMENT_DIR_TAGS = ("_vcl", "_p2junct", "_regrow", "_random_grow")
+
+
+def _strip_optional_experiment_dir_tags(name):
+    """
+    Strip trailing shift/plasticity tags (_vcl, _p2junct, _regrow, _random_grow) in any order.
+    Returns (stripped_name, list of tag names without leading underscores).
+    """
+    name = str(name)
+    tags = []
+    changed = True
+    while changed:
+        changed = False
+        for tag in _OPTIONAL_EXPERIMENT_DIR_TAGS:
+            if name.endswith(tag):
+                name = name[: -len(tag)]
+                tags.append(tag.lstrip("_"))
+                changed = True
+                break
+    return name, tags
+
+
 def _parse_experiment_dir_name(dirname):
     """
     Parse CNN experiment directory names, e.g.:
@@ -691,9 +713,15 @@ def _parse_experiment_dir_name(dirname):
       plasticity_20f_20f_5e-06_prune_only
       static_replay_20f_20f_5e-06
       three_phase_baseline_20f_20f
-    Returns dict with keys: kind, conv_tag, init_width, lambda_penalty, junctures_mode, label
+      baseline_300f_300f_vcl
+    Returns dict with keys: kind, conv_tag, init_width, lambda_penalty, junctures_mode, label, dir_tags
     """
-    name = os.path.basename(str(dirname).rstrip("/"))
+    raw_name = os.path.basename(str(dirname).rstrip("/"))
+    name, dir_tags = _strip_optional_experiment_dir_tags(raw_name)
+
+    def _with_tags(meta):
+        meta["dir_tags"] = list(dir_tags)
+        return meta
 
     m = re.match(
         r"^plasticity_((?:\d+f_)*\d+f)_([0-9.e+-]+)_(prune|grow|both_gp)_only$",
@@ -803,14 +831,14 @@ def _parse_experiment_dir_name(dirname):
             "label": f"nest {conv_display} p={nest_p:g} floor={nest_floor_acc:g}",
         }
 
-    return {
+    return _with_tags({
         "kind": "unknown",
         "conv_tag": None,
         "init_width": None,
         "lambda_penalty": None,
         "junctures_mode": None,
         "label": name,
-    }
+    })
 
 
 def _resolve_summary_x_value(row0, x_col):

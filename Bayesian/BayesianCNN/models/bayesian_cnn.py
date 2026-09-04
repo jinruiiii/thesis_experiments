@@ -35,10 +35,27 @@ class BayesianConv2d(nn.Module):
             self.mu_b = nn.Parameter(torch.randn(out_channels) * 0.1)
             self.rho_b = nn.Parameter(torch.ones(out_channels) * -3)
 
-        self.prior = torch.distributions.Normal(0, 1)
+        self.register_buffer(
+            "prior_mu_w", torch.zeros(out_channels, in_channels, kH, kW)
+        )
+        self.register_buffer(
+            "prior_sigma_w", torch.ones(out_channels, in_channels, kH, kW)
+        )
+        if self.bias_flag:
+            self.register_buffer("prior_mu_b", torch.zeros(out_channels))
+            self.register_buffer("prior_sigma_b", torch.ones(out_channels))
 
     def _sigma(self, rho):
         return F.softplus(rho)
+
+    def set_prior_from_posterior(self):
+        """Freeze current variational posterior as the KL prior (VCL-style)."""
+        with torch.no_grad():
+            self.prior_mu_w.copy_(self.mu_w.detach())
+            self.prior_sigma_w.copy_(self._sigma(self.rho_w).detach().clamp_min(1e-6))
+            if self.bias_flag:
+                self.prior_mu_b.copy_(self.mu_b.detach())
+                self.prior_sigma_b.copy_(self._sigma(self.rho_b).detach().clamp_min(1e-6))
 
     def forward(self, x):
         sigma_w = self._sigma(self.rho_w)
@@ -55,11 +72,17 @@ class BayesianConv2d(nn.Module):
 
     def kl_loss(self):
         posterior_w = torch.distributions.Normal(self.mu_w, self._sigma(self.rho_w))
-        kl = torch.distributions.kl_divergence(posterior_w, self.prior).sum()
+        prior_w = torch.distributions.Normal(
+            self.prior_mu_w, self.prior_sigma_w.clamp_min(1e-6)
+        )
+        kl = torch.distributions.kl_divergence(posterior_w, prior_w).sum()
 
         if self.bias_flag:
             posterior_b = torch.distributions.Normal(self.mu_b, self._sigma(self.rho_b))
-            kl += torch.distributions.kl_divergence(posterior_b, self.prior).sum()
+            prior_b = torch.distributions.Normal(
+                self.prior_mu_b, self.prior_sigma_b.clamp_min(1e-6)
+            )
+            kl += torch.distributions.kl_divergence(posterior_b, prior_b).sum()
 
         return kl
 
@@ -120,6 +143,13 @@ class BayesianCNN(nn.Module):
         kl += self.fc.kl_loss()
         kl += self.classifier.kl_loss()
         return kl
+
+    def set_prior_from_posterior(self):
+        """Freeze current variational posterior as the KL prior (VCL-style)."""
+        for layer in self.conv_layers:
+            layer.set_prior_from_posterior()
+        self.fc.set_prior_from_posterior()
+        self.classifier.set_prior_from_posterior()
 
     def get_param_stats(self):
         total_params = sum(p.numel() for p in self.parameters())

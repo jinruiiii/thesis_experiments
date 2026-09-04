@@ -330,6 +330,7 @@ def run_adaptive_experiment(
     global_prune_normalize="percentile",
     checkpoint_metric="val_loss_total",
     grow_new_only_steps=None,
+    random_growth=False,
 ):
     if output_dir is None:
         output_dir = os.path.join("./results", experiment_name)
@@ -468,6 +469,7 @@ def run_adaptive_experiment(
                 global_prune_budget=global_prune_budget,
                 global_prune_normalize=global_prune_normalize,
                 grow_new_only_steps=grow_new_only_steps,
+                random_growth=random_growth,
             )
             metrics["structural_epochs"].append(epoch)
             metrics["structural_actions"].append(action)
@@ -870,8 +872,8 @@ def main(
     run_mode="plasticity",
     fc_hidden=64,
     warm_start_steps=64,
-    grow_new_only_steps=32
-
+    grow_new_only_steps=32,
+    random_growth=False,
 ):
     """
     dataset options:
@@ -894,6 +896,10 @@ def main(
       - phase3_epochs: epochs after pruning back to original width (checkpoint selection)
       - three_phase_growth_layer_idx: 0-based conv layer index to grow
       - three_phase_growth_gamma: fraction of layer width to add (default 1.0)
+
+    random_growth:
+      - False (default): choose grow layer by uncertainty/MAD scores
+      - True: choose grow layer uniformly at random among eligible layers (ablation)
     """
     allowed_run_modes = {
         "baseline",
@@ -1053,6 +1059,8 @@ def main(
 
     if run_mode == "plasticity":
         suffix = _experiment_dir_suffix(junctures_mode)
+        if random_growth:
+            suffix = f"{suffix}_random_grow"
         lam_tag = _format_lambda_dir(lambda_penalty)
         plasticity_output_dir = os.path.join(
             save_path, f"plasticity_{conv_tag}_{lam_tag}{suffix}"
@@ -1091,6 +1099,7 @@ def main(
             global_prune_normalize=global_prune_normalize,
             checkpoint_metric=checkpoint_metric,
             grow_new_only_steps=grow_new_only_steps,
+            random_growth=random_growth,
         )
 
 

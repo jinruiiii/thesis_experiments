@@ -97,21 +97,37 @@ if __name__ == "__main__":
 
 # directory name is wrong is 0.1 and not 0.05 and also run the 0 lambda penalty experiment for plasticity
 
-    for prune_acc_floor in [71.25, 70.75]:
-        for i in range(1, 6):
-            set_seed(SEED + i)
-            run_nest.main(
-                save_path=f"./results_cifar10_nest/run_{i}",
-                conv_channels=(300, 100),
-                dataset="cifar10",
-                cifar10_grayscale=False,
-                seed_activate_frac=0.1,
-                reference_acc=71.5,
-                prune_acc_floor=prune_acc_floor,
-                max_growth_epochs=200,
-                grow_interval=2,
-                conn_grow_frac=0.01,
-                prune_frac=0.01,
-                max_prune_rounds=500,
-                prune_retrain_epochs=2,
-            )
+    # for prune_acc_floor in [71.25, 70.75]:
+    #     for i in range(1, 6):
+    #         set_seed(SEED + i)
+    #         run_nest.main(
+    #             save_path=f"./results_cifar10_nest/run_{i}",
+    #             conv_channels=(300, 100),
+    #             dataset="cifar10",
+    #             cifar10_grayscale=False,
+    #             seed_activate_frac=0.1,
+    #             reference_acc=71.5,
+    #             prune_acc_floor=prune_acc_floor,
+    #             max_growth_epochs=200,
+    #             grow_interval=2,
+    #             conn_grow_frac=0.01,
+    #             prune_frac=0.01,
+    #             max_prune_rounds=500,
+    #             prune_retrain_epochs=2,
+    #         )
+
+    for channels in [[300,300]]:
+        for lambda_penalty in [1e-07,5e-07,1e-06,2.5e-06,5e-06]:
+            for i in range(1, 6):
+                set_seed(SEED + i)
+                run_plasticity.main(
+                    save_path=f"./results_cifar10_random_growth/run_{i}",
+                    conv_channels=channels,
+                    lambda_penalty=lambda_penalty,
+                    run_mode="plasticity",
+                    dataset="cifar10",
+                    cifar10_grayscale=False,
+                    fc_hidden=128,
+                    warm_start_steps=32,
+                    grow_new_only_steps=16
+                )

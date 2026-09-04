@@ -1,6 +1,7 @@
 """Filter-level growth/pruning for BayesianCNN (FNN-parity options)."""
 import copy
 import math
+import random
 
 import torch
 import torch.nn.functional as F
@@ -340,6 +341,21 @@ def truncate_and_load_conv_stack(old_sd, keep_dict, new_model):
                     w = w[keep_i]
             new_sd[key] = w
 
+        for p in ["prior_mu_w", "prior_sigma_w", "prior_mu_b", "prior_sigma_b"]:
+            key = f"conv_layers.{i}.{p}"
+            if key not in old_sd:
+                continue
+            w = old_sd[key]
+            if w.ndim == 4:
+                if keep_i is not None:
+                    w = w[keep_i, :, :, :]
+                if keep_prev is not None:
+                    w = w[:, keep_prev, :, :]
+            else:
+                if keep_i is not None:
+                    w = w[keep_i]
+            new_sd[key] = w
+
         for p in ["weight", "bias"]:
             key = f"gn_layers.{i}.{p}"
             if key not in old_sd:
@@ -502,6 +518,7 @@ def filtergenesis(
     uncertainty_combine="geometric",
     growth_layer_score="mean",
     growth_mad_percentile=100.0,
+    random_growth=False,
 ):
     growth_layer_score = _normalize_growth_layer_score(growth_layer_score)
     growth_mad_percentile = _validate_growth_mad_percentile(growth_mad_percentile)
@@ -513,40 +530,53 @@ def filtergenesis(
         print("[filtergenesis] All layers excluded; ignoring exclude list for this step.")
         eligible = list(range(n_layers))
 
-    if growth_layer_score == "mean":
-        uncertainty = plasticity_original.get_average_bidirectional_uncertainty_per_layer(
-            combine=uncertainty_combine
-        )
-        layer_scores = {
-            i: uncertainty[i].item() / (conv_channels[i] ** 0.5)
-            for i in range(n_layers)
-        }
-        print("\n Average Bidirectional Normalised Uncertainty per Conv Layer:")
-        for i, val in enumerate(uncertainty):
-            print(f"  Layer {i+1}: {val.item()/(conv_channels[i]**0.5):.6f}")
-        score_label = "normalised mean uncertainty"
-    else:
-        raw = _collect_conv_filter_uncertainty_scores(
-            plasticity_original, uncertainty_combine=uncertainty_combine
-        )
-        layer_scores = _layer_growth_scores_from_mad(raw, growth_mad_percentile)
-        pct_label = "max" if growth_mad_percentile >= 100.0 else f"p{growth_mad_percentile:g}"
+    if random_growth:
+        layer_to_expand = random.choice(eligible)
+        filters_to_add = max(1, math.ceil(gamma * conv_channels[layer_to_expand]))
+        old_width = conv_channels[layer_to_expand]
         print(
-            f"\n Growth layer MAD scores (combine={uncertainty_combine}, "
-            f"percentile={growth_mad_percentile:g}):"
+            f"\n[filtergenesis] random_growth=True; eligible layers={eligible}"
         )
-        for i in sorted(layer_scores.keys()):
-            print(f"  Layer {i+1}: mad_{pct_label}={layer_scores[i]:.6f}")
-        score_label = f"mad_{pct_label}"
+        print(
+            f"Expanding Conv Layer {layer_to_expand+1} "
+            f"(random choice among {len(eligible)} eligible) "
+            f"by {filters_to_add} filters"
+        )
+    else:
+        if growth_layer_score == "mean":
+            uncertainty = plasticity_original.get_average_bidirectional_uncertainty_per_layer(
+                combine=uncertainty_combine
+            )
+            layer_scores = {
+                i: uncertainty[i].item() / (conv_channels[i] ** 0.5)
+                for i in range(n_layers)
+            }
+            print("\n Average Bidirectional Normalised Uncertainty per Conv Layer:")
+            for i, val in enumerate(uncertainty):
+                print(f"  Layer {i+1}: {val.item()/(conv_channels[i]**0.5):.6f}")
+            score_label = "normalised mean uncertainty"
+        else:
+            raw = _collect_conv_filter_uncertainty_scores(
+                plasticity_original, uncertainty_combine=uncertainty_combine
+            )
+            layer_scores = _layer_growth_scores_from_mad(raw, growth_mad_percentile)
+            pct_label = "max" if growth_mad_percentile >= 100.0 else f"p{growth_mad_percentile:g}"
+            print(
+                f"\n Growth layer MAD scores (combine={uncertainty_combine}, "
+                f"percentile={growth_mad_percentile:g}):"
+            )
+            for i in sorted(layer_scores.keys()):
+                print(f"  Layer {i+1}: mad_{pct_label}={layer_scores[i]:.6f}")
+            score_label = f"mad_{pct_label}"
 
-    layer_to_expand = max(eligible, key=lambda i: layer_scores[i])
-    filters_to_add = max(1, math.ceil(gamma * conv_channels[layer_to_expand]))
-    old_width = conv_channels[layer_to_expand]
-    print(
-        f"Expanding Conv Layer {layer_to_expand+1} "
-        f"(highest {score_label}: {layer_scores[layer_to_expand]:.6f}) "
-        f"by {filters_to_add} filters"
-    )
+        layer_to_expand = max(eligible, key=lambda i: layer_scores[i])
+        filters_to_add = max(1, math.ceil(gamma * conv_channels[layer_to_expand]))
+        old_width = conv_channels[layer_to_expand]
+        print(
+            f"Expanding Conv Layer {layer_to_expand+1} "
+            f"(highest {score_label}: {layer_scores[layer_to_expand]:.6f}) "
+            f"by {filters_to_add} filters"
+        )
 
     expanded_conv_channels = conv_channels.copy()
     expanded_conv_channels[layer_to_expand] += filters_to_add
@@ -802,11 +832,13 @@ def structural_decision_juncture(
     global_prune_budget="params",
     global_prune_normalize="percentile",
     grow_new_only_steps=None,
+    random_growth=False,
 ):
     """
     Evaluate growth and/or prune candidates via delta penalised ELBO on B_val.
     junctures_mode: "both", "grow", "prune", or "both_gp" (grow, prune, or grow+prune).
     grow_new_only_steps: first N grow warm-start steps use new-only mask (default all K).
+    random_growth: if True, pick grow layer uniformly among eligible instead of uncertainty/MAD.
     """
     if junctures_mode not in ("both", "grow", "prune", "both_gp"):
         raise ValueError(
@@ -856,6 +888,7 @@ def structural_decision_juncture(
         "growth_layer_score": growth_layer_score,
         "growth_mad_percentile": growth_mad_percentile,
         "grow_new_only_steps": resolved_grow_new_only_steps,
+        "random_growth": bool(random_growth),
     }
     if grow_exclude_layers is None:
         grow_exclude_layers = []
@@ -874,6 +907,7 @@ def structural_decision_juncture(
             uncertainty_combine=uncertainty_combine,
             growth_layer_score=growth_layer_score,
             growth_mad_percentile=growth_mad_percentile,
+            random_growth=random_growth,
         )
         expand_and_load_conv_stack(model.state_dict(), grow_model)
         warm_start_model_on_batches(
@@ -940,6 +974,7 @@ def structural_decision_juncture(
             uncertainty_combine=uncertainty_combine,
             growth_layer_score=growth_layer_score,
             growth_mad_percentile=growth_mad_percentile,
+            random_growth=random_growth,
         )
         expand_and_load_conv_stack(model.state_dict(), gp_grow_model)
         keep_dict_gp, prune_stats_gp = filterapoptosis(
