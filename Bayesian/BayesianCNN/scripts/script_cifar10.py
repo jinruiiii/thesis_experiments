@@ -129,5 +129,8 @@ if __name__ == "__main__":
                     cifar10_grayscale=False,
                     fc_hidden=128,
                     warm_start_steps=32,
-                    grow_new_only_steps=16
+                    grow_new_only_steps=16,
+                    random_growth=True
                 )
+
+

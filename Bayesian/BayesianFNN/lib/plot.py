@@ -729,12 +729,12 @@ def _junctures_mode_label(mode):
     return str(mode)
 
 
-_OPTIONAL_EXPERIMENT_DIR_TAGS = ("_vcl", "_p2junct", "_regrow")
+_OPTIONAL_EXPERIMENT_DIR_TAGS = ("_vcl", "_p2junct", "_regrow", "_random_grow")
 
 
 def _strip_optional_experiment_dir_tags(name):
     """
-    Strip trailing main4 tags (_vcl, _p2junct, _regrow) in any order.
+    Strip trailing main4 tags (_vcl, _p2junct, _regrow, _random_grow) in any order.
     Returns (stripped_name, list of tag names without leading underscores).
     """
     name = str(name)
@@ -2504,39 +2504,56 @@ def plot_gamma_pareto_comparison(
         plot_source = df
         x_plot_col, y_plot_col = "x", "y"
 
-    if show_points and aggregate_runs and grouped is not None:
-        for _, row in grouped.iterrows():
-            if row["kind"] not in kinds:
-                continue
-            color = color_map[row["gamma_label"]]
-            ax.errorbar(
-                row["x_mean"],
-                row["y_mean"],
-                xerr=row["x_std"] if pd.notna(row["x_std"]) else None,
-                yerr=row["y_std"] if pd.notna(row["y_std"]) else None,
-                fmt="o",
-                color=color,
-                markerfacecolor=color,
-                markeredgecolor=color,
-                markeredgewidth=1.0,
-                markersize=8,
-                capsize=3,
-                linestyle="none",
-                alpha=0.95,
-                zorder=2,
-            )
-        for _, row in df.iterrows():
-            if row["kind"] not in kinds:
-                continue
-            color = color_map[row["gamma_label"]]
-            ax.scatter(
-                row["x"],
-                row["y"],
-                color=color,
-                alpha=alpha_individual,
-                s=marker_size * 0.5,
-                zorder=1,
-            )
+    if aggregate_runs and grouped is not None:
+        mean_markersize = max(1.0, float(marker_size) ** 0.5)
+        if show_points:
+            for _, row in grouped.iterrows():
+                if row["kind"] not in kinds:
+                    continue
+                color = color_map[row["gamma_label"]]
+                ax.errorbar(
+                    row["x_mean"],
+                    row["y_mean"],
+                    xerr=row["x_std"] if pd.notna(row["x_std"]) else None,
+                    yerr=row["y_std"] if pd.notna(row["y_std"]) else None,
+                    fmt="s",
+                    color=color,
+                    markerfacecolor=color,
+                    markeredgecolor="black",
+                    markeredgewidth=0.4,
+                    markersize=mean_markersize,
+                    capsize=3,
+                    linestyle="none",
+                    alpha=0.95,
+                    zorder=2,
+                )
+            for _, row in df.iterrows():
+                if row["kind"] not in kinds:
+                    continue
+                color = color_map[row["gamma_label"]]
+                ax.scatter(
+                    row["x"],
+                    row["y"],
+                    color=color,
+                    alpha=alpha_individual,
+                    s=marker_size * 0.5,
+                    zorder=1,
+                )
+        else:
+            for _, row in grouped.iterrows():
+                if row["kind"] not in kinds:
+                    continue
+                color = color_map[row["gamma_label"]]
+                ax.scatter(
+                    row["x_mean"],
+                    row["y_mean"],
+                    marker="s",
+                    facecolors=color,
+                    edgecolors="black",
+                    linewidths=0.4,
+                    s=marker_size,
+                    zorder=2,
+                )
 
     for gamma_label in gamma_labels:
         color = color_map[gamma_label]

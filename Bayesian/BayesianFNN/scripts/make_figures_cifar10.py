@@ -166,4 +166,64 @@ if __name__ == "__main__":
         show=False,
     )
 
+    _cifar_plasticity_experiments = [
+        # uncertainty growth (under results_cifar10)
+        "plasticity_500_0",
+        "plasticity_500_1e-07",
+        "plasticity_500_5e-07",
+        "plasticity_500_1e-06",
+        "plasticity_500_5e-06",
+        # random growth (under results_cifar10_plasticity_random_growth)
+        "plasticity_500_0_random_grow",
+        "plasticity_500_1e-07_random_grow",
+        "plasticity_500_5e-07_random_grow",
+        "plasticity_500_1e-06_random_grow",
+        "plasticity_500_5e-06_random_grow",
+    ]
+    plot_gamma_pareto_comparison(
+        save_paths=[
+            "results_cifar10",
+            "results_cifar10_plasticity_random_growth",
+        ],
+        gamma_labels=["Uncertainty growth", "Random growth"],
+        experiments=_cifar_plasticity_experiments,
+        num_runs=5,
+        y_col="Test Acc",
+        ylabel="Test Acc",
+        title="Test Acc vs Parameter Count",
+        xlabel="Parameter Count",
+        show_points=True,
+        legend_mode="pareto",
+        axis_label_fontsize=20,
+        tick_label_fontsize=20,
+        title_fontsize=20,
+        legend_fontsize=20,
+        pareto_linewidth=5,
+        x_tick_interval=100_000,
+        save_path_out="cifar10_plots/random_growth/brier.pdf",
+        show=False,
+    )
 
+    plot_gamma_pareto_comparison(
+        save_paths=[
+            "results_cifar10",
+            "results_cifar10_plasticity_random_growth",
+        ],
+        gamma_labels=["Uncertainty growth", "Random growth"],
+        experiments=_cifar_plasticity_experiments,
+        num_runs=5,
+        y_col="Test Brier",
+        ylabel="Test Brier",
+        title="Test Brier vs Parameter Count",
+        xlabel="Parameter Count",
+        show_points=True,
+        legend_mode="pareto",
+        axis_label_fontsize=20,
+        tick_label_fontsize=20,
+        title_fontsize=20,
+        legend_fontsize=20,
+        pareto_linewidth=5,
+        x_tick_interval=100_000,
+        save_path_out="cifar10_plots/random_growth/acc.pdf",
+        show=False,
+    )

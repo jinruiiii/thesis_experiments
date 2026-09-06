@@ -235,7 +235,7 @@ if __name__ == "__main__":
         ylabel="Test Acc",
         title="Test Acc vs Parameter Count",
         xlabel="Parameter Count",
-        show_points=True,
+        show_points=False,
         legend_mode="pareto",
         axis_label_fontsize=20,
         tick_label_fontsize=20,
@@ -245,6 +245,7 @@ if __name__ == "__main__":
         x_tick_interval=100_000,
         save_path_out="fashionmnist_plots/growth_rates/gamma_pareto_acc.pdf",
         show=False,
+        marker_size=150,
     )
 
     plot_gamma_pareto_comparison(
@@ -260,7 +261,7 @@ if __name__ == "__main__":
         ylabel="Test Brier",
         title="Test Brier vs Parameter Count",
         xlabel="Parameter Count",
-        show_points=True,
+        show_points=False,
         legend_mode="pareto",
         axis_label_fontsize=20,
         tick_label_fontsize=20,
@@ -270,4 +271,70 @@ if __name__ == "__main__":
         x_tick_interval=100_000,
         save_path_out="fashionmnist_plots/growth_rates/gamma_pareto_brier.pdf",
         show=False,
+        marker_size=150,
+    )
+
+    _fashionmnist_plasticity_experiments = [
+        # uncertainty growth (under results_cifar10)
+        "plasticity_500_0",
+        "plasticity_500_1e-07",
+        "plasticity_500_5e-07",
+        "plasticity_500_1e-06",
+        "plasticity_500_5e-06",
+        # random growth (under results_cifar10_plasticity_random_growth)
+        "plasticity_500_0_random_grow",
+        "plasticity_500_1e-07_random_grow",
+        "plasticity_500_5e-07_random_grow",
+        "plasticity_500_1e-06_random_grow",
+        "plasticity_500_5e-06_random_grow",
+    ]
+
+    plot_gamma_pareto_comparison(
+        save_paths=[
+            "results_fashionmnist",
+            "results_fashionmnist_plasticity_random_growth",
+        ],
+        gamma_labels=["Uncertainty growth", "Random growth"],
+        experiments=_fashionmnist_plasticity_experiments,
+        num_runs=5,
+        y_col="Test Acc",
+        ylabel="Test Acc",
+        title="Test Acc vs Parameter Count",
+        xlabel="Parameter Count",
+        show_points=False,
+        legend_mode="pareto",
+        axis_label_fontsize=20,
+        tick_label_fontsize=20,
+        title_fontsize=20,
+        legend_fontsize=20,
+        pareto_linewidth=5,
+        x_tick_interval=100_000,
+        save_path_out="fashionmnist_plots/random_growth/acc.pdf",
+        show=False,
+        marker_size=150,
+    )
+
+    plot_gamma_pareto_comparison(
+        save_paths=[
+            "results_fashionmnist",
+            "results_fashionmnist_plasticity_random_growth",
+        ],
+        gamma_labels=["Uncertainty growth", "Random growth"],
+        experiments=_fashionmnist_plasticity_experiments,
+        num_runs=5,
+        y_col="Test Brier",
+        ylabel="Test Brier",
+        title="Test Brier vs Parameter Count",
+        xlabel="Parameter Count",
+        show_points=False,
+        legend_mode="pareto",
+        axis_label_fontsize=20,
+        tick_label_fontsize=20,
+        title_fontsize=20,
+        legend_fontsize=20,
+        pareto_linewidth=5,
+        x_tick_interval=100_000,
+        save_path_out="fashionmnist_plots/random_growth/brier.pdf",
+        show=False,
+        marker_size=150,
     )

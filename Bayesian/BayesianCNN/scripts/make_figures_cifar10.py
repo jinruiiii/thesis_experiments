@@ -213,42 +213,40 @@ if __name__ == "__main__":
         show=False,
     )
 
-    _pareto_plot_kwargs = dict(
-        save_path="results_prior_shift_cifar10",
-        num_runs=5,
-        aggregate_runs=True,
-        show_pareto_frontier=True,
-        pareto_scope="per_junctures_mode",
-        pareto_frontier_kinds=_cifar_pareto_kinds,
-        x_col="Parameters",
-        xlabel="Parameter Count",
-        show=False,
-        legend_mode="pareto",
-        pareto_linewidth=5,
-        axis_label_fontsize=20,
-        tick_label_fontsize=20,
-        title_fontsize=20,
-        legend_fontsize=20,
-        nest_x_modes=("sparse"),
-        x_tick_interval=100_000,
-        show_points=False,
-        marker_size=120,
-    )
+    _cifar_random_growth_compare = [
+        "plasticity_300f_300f_1e-07",
+        "plasticity_300f_300f_5e-07",
+        "plasticity_300f_300f_1e-06",
+        "plasticity_300f_300f_2.5e-06",
+        "plasticity_300f_300f_5e-06",
+        "plasticity_300f_300f_1e-07_random_grow",
+        "plasticity_300f_300f_5e-07_random_grow",
+        "plasticity_300f_300f_1e-06_random_grow",
+        "plasticity_300f_300f_2.5e-06_random_grow",
+        "plasticity_300f_300f_5e-06_random_grow",
+    ]
 
     plot_param_count_vs_test_acc(
-        experiments=_cifar_shift_experiments,
-        save_path_out="cifar10_plots/shift/shift_accuracy.pdf",
+        experiments=_cifar_random_growth_compare,
+        save_path_out="cifar10_plots/random_growth/acc.pdf",
         title="Test Acc vs Parameter Count",
         y_col="Test Acc",
         ylabel="Test Acc",
-        **_pareto_plot_kwargs,
+        **{
+            **_pareto_plot_kwargs,
+            "pareto_frontier_kinds": ("plasticity", "plasticity_random"),
+        },
     )
 
     plot_param_count_vs_test_acc(
-        experiments=_cifar_shift_experiments,
-        save_path_out="cifar10_plots/shift/shift_brier.pdf",
+        experiments=_cifar_random_growth_compare,
+        save_path_out="cifar10_plots/random_growth/brier.pdf",
         title="Test Brier vs Parameter Count",
         y_col="Test Brier",
         ylabel="Test Brier",
-        **_pareto_plot_kwargs,
+        **{
+            **_pareto_plot_kwargs,
+            "pareto_frontier_kinds": ("plasticity", "plasticity_random"),
+        },
     )
+

@@ -609,6 +609,7 @@ def run_adaptive_experiment(
     global_prune_normalize="percentile",
     checkpoint_metric="val_loss_total",
     grow_new_only_steps=None,
+    random_growth=False,
 ):
     """
     Dynamic structural adaptation via penalised ELBO.
@@ -624,6 +625,7 @@ def run_adaptive_experiment(
     checkpoint_metric: "val_loss_nll" or "val_loss_total" for best-checkpoint selection.
     grow_new_only_steps: first N grow warm-start steps use new-only mask, rest update all
     (default None = all warm_start_steps are new-only).
+    random_growth: if True, pick grow layer uniformly among eligible instead of uncertainty/MAD.
     """
     if output_dir is None:
         output_dir = os.path.join('./results', experiment_name)
@@ -787,6 +789,7 @@ def run_adaptive_experiment(
                 global_prune_budget=global_prune_budget,
                 global_prune_normalize=global_prune_normalize,
                 grow_new_only_steps=grow_new_only_steps,
+                random_growth=random_growth,
             )
             metrics['structural_epochs'].append(epoch)
             metrics['structural_actions'].append(action)
@@ -958,7 +961,8 @@ def main(
     run_mode="plasticity",
     warm_start_steps=64,
     grow_new_only_steps=16,
-    gamma=0.0
+    gamma=0.0,
+    random_growth=False,
 ):
     """
 
@@ -967,6 +971,10 @@ def main(
       - "plasticity": run only plasticity (no baseline, no hybrid refinement)
       - "three_phase": run only three-phase baseline
       - "static_replay": train a static FNN using Hidden Sizes from an existing
+
+    random_growth:
+      - False (default): choose grow layer by uncertainty/MAD scores
+      - True: choose grow layer uniformly at random among eligible layers (ablation)
     """
     allowed_run_modes = {
         "baseline",
@@ -1123,6 +1131,8 @@ def main(
 
     if run_mode in ("plasticity"):
         suffix = _experiment_dir_suffix(junctures_mode)
+        if random_growth:
+            suffix = f"{suffix}_random_grow"
         lam_tag = _format_lambda_dir(lambda_penalty)
         plasticity_output_dir = os.path.join(
             save_path, f"plasticity_{hidden_sizes[0]}_{lam_tag}{suffix}"
@@ -1159,6 +1169,7 @@ def main(
             global_prune_normalize=global_prune_normalize,
             checkpoint_metric=checkpoint_metric,
             grow_new_only_steps=grow_new_only_steps,
+            random_growth=random_growth,
         )
 
 if __name__ == "__main__":

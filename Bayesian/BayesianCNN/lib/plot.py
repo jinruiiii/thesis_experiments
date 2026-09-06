@@ -711,6 +711,7 @@ def _parse_experiment_dir_name(dirname):
       baseline_20f_20f
       plasticity_20f_20f_5e-06
       plasticity_20f_20f_5e-06_prune_only
+      plasticity_20f_20f_5e-06_random_grow
       static_replay_20f_20f_5e-06
       three_phase_baseline_20f_20f
       baseline_300f_300f_vcl
@@ -719,8 +720,10 @@ def _parse_experiment_dir_name(dirname):
     raw_name = os.path.basename(str(dirname).rstrip("/"))
     name, dir_tags = _strip_optional_experiment_dir_tags(raw_name)
 
-    def _with_tags(meta):
+    def _finalize(meta):
         meta["dir_tags"] = list(dir_tags)
+        if meta.get("kind") == "plasticity" and "random_grow" in meta["dir_tags"]:
+            meta["kind"] = "plasticity_random"
         return meta
 
     m = re.match(
@@ -732,27 +735,27 @@ def _parse_experiment_dir_name(dirname):
         lam = float(m.group(2))
         mode = m.group(3)
         mode_label = _junctures_mode_label(mode)
-        return {
+        return _finalize({
             "kind": "plasticity",
             "conv_tag": conv_tag,
             "init_width": _init_width_from_conv_tag(conv_tag),
             "lambda_penalty": lam,
             "junctures_mode": mode,
             "label": f"plasticity {conv_tag} λ={lam:g} ({mode_label})",
-        }
+        })
 
     m = re.match(r"^plasticity_((?:\d+f_)*\d+f)_([0-9.e+-]+)$", name)
     if m:
         conv_tag = m.group(1)
         lam = float(m.group(2))
-        return {
+        return _finalize({
             "kind": "plasticity",
             "conv_tag": conv_tag,
             "init_width": _init_width_from_conv_tag(conv_tag),
             "lambda_penalty": lam,
             "junctures_mode": "both",
             "label": f"plasticity {conv_tag} λ={lam:g}",
-        }
+        })
 
     m = re.match(
         r"^static_replay_((?:\d+f_)*\d+f)_([0-9.e+-]+)_(prune|grow|both_gp)_only$",
@@ -763,51 +766,51 @@ def _parse_experiment_dir_name(dirname):
         lam = float(m.group(2))
         mode = m.group(3)
         mode_label = _junctures_mode_label(mode)
-        return {
+        return _finalize({
             "kind": "static_replay",
             "conv_tag": conv_tag,
             "init_width": _init_width_from_conv_tag(conv_tag),
             "lambda_penalty": lam,
             "junctures_mode": "static_replay",
             "label": f"static replay {conv_tag} λ={lam:g} ({mode_label})",
-        }
+        })
 
     m = re.match(r"^static_replay_((?:\d+f_)*\d+f)_([0-9.e+-]+)$", name)
     if m:
         conv_tag = m.group(1)
         lam = float(m.group(2))
-        return {
+        return _finalize({
             "kind": "static_replay",
             "conv_tag": conv_tag,
             "init_width": _init_width_from_conv_tag(conv_tag),
             "lambda_penalty": lam,
             "junctures_mode": "static_replay",
             "label": f"static replay {conv_tag} λ={lam:g}",
-        }
+        })
 
     m = re.match(r"^baseline_((?:\d+f_)*\d+f)$", name)
     if m:
         conv_tag = m.group(1)
-        return {
+        return _finalize({
             "kind": "baseline",
             "conv_tag": conv_tag,
             "init_width": _init_width_from_conv_tag(conv_tag),
             "lambda_penalty": None,
             "junctures_mode": "both",
             "label": f"baseline (init {conv_tag})",
-        }
+        })
 
     m = re.match(r"^three_phase_baseline_((?:\d+f_)*\d+f)$", name)
     if m:
         conv_tag = m.group(1)
-        return {
+        return _finalize({
             "kind": "three_phase",
             "conv_tag": conv_tag,
             "init_width": _init_width_from_conv_tag(conv_tag),
             "lambda_penalty": None,
             "junctures_mode": "three_phase",
             "label": f"three-phase baseline (init {conv_tag})",
-        }
+        })
 
     m = re.match(
         r"^nest_((?:\d+f_)*\d+f)_p([0-9.e+-]+)_refacc([0-9.e+-]+)_flooracc([0-9.e+-]+)$",
@@ -819,7 +822,7 @@ def _parse_experiment_dir_name(dirname):
         nest_ref_acc = float(m.group(3))
         nest_floor_acc = float(m.group(4))
         conv_display = conv_tag.replace("_", "/")
-        return {
+        return _finalize({
             "kind": "nest",
             "conv_tag": conv_tag,
             "init_width": _init_width_from_conv_tag(conv_tag),
@@ -829,9 +832,9 @@ def _parse_experiment_dir_name(dirname):
             "nest_ref_acc": nest_ref_acc,
             "nest_floor_acc": nest_floor_acc,
             "label": f"nest {conv_display} p={nest_p:g} floor={nest_floor_acc:g}",
-        }
+        })
 
-    return _with_tags({
+    return _finalize({
         "kind": "unknown",
         "conv_tag": None,
         "init_width": None,
@@ -973,8 +976,12 @@ def collect_experiment_summaries(
     return pd.DataFrame(rows)
 
 
-_PARETO_SPLIT_BY_INIT_WIDTH_KINDS = frozenset({"plasticity", "static_replay"})
-_PARETO_SPLIT_BY_JUNCTURES_KINDS = frozenset({"plasticity", "static_replay"})
+_PARETO_SPLIT_BY_INIT_WIDTH_KINDS = frozenset(
+    {"plasticity", "plasticity_random", "static_replay"}
+)
+_PARETO_SPLIT_BY_JUNCTURES_KINDS = frozenset(
+    {"plasticity", "plasticity_random", "static_replay"}
+)
 _DEFAULT_JUNCTURES_PARETO_LINESTYLES = {
     "both": "-",
     "prune": "--",
@@ -987,6 +994,7 @@ _DEFAULT_STYLE_MAP = {
     "baseline": {"color": "black", "marker": "s"},
     "three_phase": {"color": "#1f77b4", "marker": "D"},
     "plasticity": {"color": "#d62728", "marker": "o"},
+    "plasticity_random": {"color": "#17becf", "marker": "^"},
     "static_replay": {"color": "#2ca02c", "marker": "X"},
     "nest": {"color": "#d946ef", "marker": "v"},
     "nest_dense": {"color": "#d946ef", "marker": "v"},
@@ -1014,12 +1022,16 @@ def _kind_display_name_for_pareto(kind):
         "static_replay": "Static Replay",
         "three_phase": "Three-Phase",
         "plasticity": "Plasticity",
+        "plasticity_random": "Random Growth Plasticity",
         "nest": "NeST Sparse",
         "nest_dense": "NeST Dense",
     }.get(kind, kind)
 
 
 def _pareto_legend_label(kind, junctures_mode=None, init_width=None):
+    if kind == "plasticity_random":
+        return "Random Growth Plasticity"
+
     name = _kind_display_name_for_pareto(kind)
     if init_width is not None and not (isinstance(init_width, float) and pd.isna(init_width)):
         return f"{name} init={int(init_width)} Pareto"
@@ -1055,7 +1067,10 @@ def _junctures_mode_marker(mode):
 
 def _lambda_penalty_color_map(df, palette=None):
     lambdas = sorted(
-        df.loc[df["kind"].isin(["plasticity", "static_replay"]), "lambda_penalty"]
+        df.loc[
+            df["kind"].isin(["plasticity", "plasticity_random", "static_replay"]),
+            "lambda_penalty",
+        ]
         .dropna()
         .unique()
     )
@@ -1901,6 +1916,524 @@ def plot_param_count_vs_test_acc(
 
     if save_path_out is not None:
         fig.savefig(save_path_out, dpi=dpi, bbox_inches="tight")
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+    return fig, ax, df
+
+
+def _parse_gamma_label_from_save_path(save_path):
+    """Extract a display label from a results root like ..._gamma0.01."""
+    name = Path(save_path).name
+    match = re.search(r"gamma([0-9.e-]+)", name, re.I)
+    if match:
+        return f"γ={match.group(1)}"
+    return name
+
+
+def _default_gamma_color_map(gamma_labels, gamma_colors=None):
+    """Assign a distinct color to each gamma / growth-mode label."""
+    if gamma_colors is not None:
+        return dict(gamma_colors)
+    cmap = plt.get_cmap("tab10")
+    return {label: cmap(i % 10) for i, label in enumerate(gamma_labels)}
+
+
+def plot_gamma_pareto_comparison(
+    save_paths,
+    gamma_labels=None,
+    experiments=None,
+    experiment_glob="*",
+    num_runs=5,
+    aggregate_runs=True,
+    x_col="Parameters",
+    y_col="Test Acc",
+    xlabel=None,
+    ylabel=None,
+    title=None,
+    save_path_out=None,
+    show=True,
+    figsize=(10, 7),
+    dpi=150,
+    pareto_frontier_kinds=("plasticity",),
+    show_points=True,
+    gamma_colors=None,
+    pareto_linestyle="--",
+    pareto_linewidth=1.5,
+    pareto_y_goal=None,
+    alpha_individual=0.35,
+    marker_size=70,
+    legend_mode="pareto",
+    axis_label_fontsize=None,
+    tick_label_fontsize=None,
+    title_fontsize=None,
+    legend_fontsize=None,
+    x_tick_interval=None,
+):
+    """
+    Compare plasticity Pareto frontiers across result roots (e.g. growth modes).
+
+    Loads the same leaf experiment names from each parent ``save_path``, tags
+    rows with ``gamma_label``, then plots Acc/Brier vs parameter count.
+
+    Typical usage
+    -------------
+    plot_gamma_pareto_comparison(
+        save_paths=["results_cifar10", "results_cifar10_random_growth"],
+        gamma_labels=["Uncertainty growth", "Random growth"],
+        experiments=["plasticity_300f_300f_1e-07", ...],
+        y_col="Test Acc",
+        save_path_out="cifar10_plots/random_growth/acc.pdf",
+        show=False,
+    )
+    """
+    if not save_paths:
+        raise ValueError("save_paths must be a non-empty list of result roots")
+    if legend_mode not in ("full", "pareto"):
+        raise ValueError(
+            f"legend_mode must be 'full' or 'pareto', got {legend_mode!r}"
+        )
+
+    save_paths = [Path(p) for p in save_paths]
+    if gamma_labels is None:
+        gamma_labels = [_parse_gamma_label_from_save_path(p) for p in save_paths]
+    if len(gamma_labels) != len(save_paths):
+        raise ValueError(
+            f"gamma_labels length ({len(gamma_labels)}) must match "
+            f"save_paths ({len(save_paths)})"
+        )
+
+    frames = []
+    for save_path, gamma_label in zip(save_paths, gamma_labels):
+        frame = collect_experiment_summaries(
+            save_path=str(save_path),
+            experiments=experiments,
+            experiment_glob=experiment_glob,
+            num_runs=num_runs,
+            x_col=x_col,
+            y_col=y_col,
+        )
+        frame = frame.copy()
+        frame["gamma_label"] = gamma_label
+        frames.append(frame)
+    df = pd.concat(frames, ignore_index=True)
+
+    if xlabel is None:
+        if x_col in ("FLOPs", "FLOPs_realized", "FLOPs_theoretical"):
+            xlabel = "FLOPs"
+        elif x_col == "Sparse Parameters":
+            xlabel = "Sparse parameter count"
+        elif x_col == "Dense Parameters":
+            xlabel = "Dense parameter count"
+        else:
+            xlabel = "Parameter count"
+    if ylabel is None:
+        ylabel = y_col
+    if title is None:
+        title = f"{ylabel} vs parameter count by growth rate"
+
+    resolved_y_goal = pareto_y_goal or _infer_pareto_y_goal(y_col, ylabel)
+    color_map = _default_gamma_color_map(gamma_labels, gamma_colors=gamma_colors)
+    kinds = tuple(pareto_frontier_kinds)
+    resolved_pareto_linestyle = _resolve_pareto_linestyle(
+        pareto_linestyle, kind="plasticity", junctures_mode="both"
+    )
+
+    fig, ax = plt.subplots(figsize=figsize)
+    pareto_handles = []
+    grouped = None
+
+    if aggregate_runs:
+        grouped = (
+            df.groupby(["gamma_label", "experiment"], dropna=False)
+            .agg(
+                x_mean=("x", "mean"),
+                x_std=("x", "std"),
+                y_mean=("y", "mean"),
+                y_std=("y", "std"),
+                kind=("kind", "first"),
+                n_runs=("run", "nunique"),
+            )
+            .reset_index()
+        )
+        plot_source = grouped
+        x_plot_col, y_plot_col = "x_mean", "y_mean"
+    else:
+        plot_source = df
+        x_plot_col, y_plot_col = "x", "y"
+
+    if show_points and aggregate_runs and grouped is not None:
+        for _, row in grouped.iterrows():
+            if row["kind"] not in kinds:
+                continue
+            color = color_map[row["gamma_label"]]
+            ax.errorbar(
+                row["x_mean"],
+                row["y_mean"],
+                xerr=row["x_std"] if pd.notna(row["x_std"]) else None,
+                yerr=row["y_std"] if pd.notna(row["y_std"]) else None,
+                fmt="o",
+                color=color,
+                markerfacecolor=color,
+                markeredgecolor=color,
+                markeredgewidth=1.0,
+                markersize=8,
+                capsize=3,
+                linestyle="none",
+                alpha=0.95,
+                zorder=2,
+            )
+        for _, row in df.iterrows():
+            if row["kind"] not in kinds:
+                continue
+            color = color_map[row["gamma_label"]]
+            ax.scatter(
+                row["x"],
+                row["y"],
+                color=color,
+                alpha=alpha_individual,
+                s=marker_size * 0.5,
+                zorder=1,
+            )
+
+    for gamma_label in gamma_labels:
+        color = color_map[gamma_label]
+        subset = plot_source[
+            (plot_source["gamma_label"] == gamma_label)
+            & (plot_source["kind"].isin(kinds))
+        ]
+        if subset.empty:
+            continue
+
+        if show_points and not aggregate_runs:
+            ax.scatter(
+                subset[x_plot_col],
+                subset[y_plot_col],
+                color=color,
+                alpha=alpha_individual,
+                s=marker_size * 0.5,
+                zorder=2,
+            )
+
+        pareto_df = subset.rename(columns={x_plot_col: "x", y_plot_col: "y"})
+        handle = _draw_pareto_frontier(
+            ax,
+            pareto_df,
+            color=color,
+            label=f"{gamma_label} Pareto",
+            y_goal=resolved_y_goal,
+            linestyle=resolved_pareto_linestyle,
+            linewidth=pareto_linewidth,
+        )
+        if handle is not None:
+            pareto_handles.append(handle)
+
+    if legend_mode == "full":
+        point_handles = []
+        for gamma_label in gamma_labels:
+            if gamma_label not in df["gamma_label"].values:
+                continue
+            color = color_map[gamma_label]
+            point_handles.append(
+                Line2D(
+                    [0],
+                    [0],
+                    marker="o",
+                    color="w",
+                    markerfacecolor=color,
+                    markeredgecolor=color,
+                    markersize=8,
+                    label=gamma_label,
+                )
+            )
+        handles = point_handles + pareto_handles
+        legend_title = "Growth mode / Pareto"
+    else:
+        handles = list(pareto_handles)
+        legend_title = "Pareto"
+
+    if handles:
+        legend_kwargs = {"handles": handles, "title": legend_title}
+        if legend_fontsize is not None:
+            legend_kwargs["fontsize"] = legend_fontsize
+            legend_kwargs["title_fontsize"] = legend_fontsize
+        ax.legend(**legend_kwargs)
+
+    ax.set_xlabel(xlabel, fontsize=axis_label_fontsize)
+    ax.set_ylabel(ylabel, fontsize=axis_label_fontsize)
+    if x_tick_interval is not None:
+        from matplotlib.ticker import MultipleLocator
+
+        ax.xaxis.set_major_locator(MultipleLocator(float(x_tick_interval)))
+    if tick_label_fontsize is not None:
+        ax.tick_params(axis="both", labelsize=tick_label_fontsize)
+    ax.set_title(title, fontsize=title_fontsize)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    if save_path_out is not None:
+        out = Path(save_path_out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(out, dpi=dpi, bbox_inches="tight")
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+    return fig, ax, df
+
+
+def _parse_gamma_label_from_save_path(save_path):
+    """Extract a display label from a results root like ..._gamma0.01."""
+    name = Path(save_path).name
+    match = re.search(r"gamma([0-9.e-]+)", name, re.I)
+    if match:
+        return f"γ={match.group(1)}"
+    return name
+
+
+def _default_gamma_color_map(gamma_labels, gamma_colors=None):
+    """Assign a distinct color to each gamma / growth-mode label."""
+    if gamma_colors is not None:
+        return dict(gamma_colors)
+    cmap = plt.get_cmap("tab10")
+    return {label: cmap(i % 10) for i, label in enumerate(gamma_labels)}
+
+
+def plot_gamma_pareto_comparison(
+    save_paths,
+    gamma_labels=None,
+    experiments=None,
+    experiment_glob="*",
+    num_runs=5,
+    aggregate_runs=True,
+    x_col="Parameters",
+    y_col="Test Acc",
+    xlabel=None,
+    ylabel=None,
+    title=None,
+    save_path_out=None,
+    show=True,
+    figsize=(10, 7),
+    dpi=150,
+    pareto_frontier_kinds=("plasticity",),
+    show_points=True,
+    gamma_colors=None,
+    pareto_linestyle="--",
+    pareto_linewidth=1.5,
+    pareto_y_goal=None,
+    alpha_individual=0.35,
+    marker_size=70,
+    legend_mode="pareto",
+    axis_label_fontsize=None,
+    tick_label_fontsize=None,
+    title_fontsize=None,
+    legend_fontsize=None,
+    x_tick_interval=None,
+):
+    """
+    Compare plasticity Pareto frontiers across result roots (e.g. growth modes).
+
+    Loads the same leaf experiment names from each parent ``save_path``, tags
+    rows with ``gamma_label``, then plots Acc/Brier vs parameter count.
+
+    Typical usage
+    -------------
+    plot_gamma_pareto_comparison(
+        save_paths=["results_cifar10", "results_cifar10_random_growth"],
+        gamma_labels=["Uncertainty growth", "Random growth"],
+        experiments=["plasticity_300f_300f_1e-07", ...],
+        y_col="Test Acc",
+        save_path_out="cifar10_plots/random_growth/acc.pdf",
+        show=False,
+    )
+    """
+    if not save_paths:
+        raise ValueError("save_paths must be a non-empty list of result roots")
+    if legend_mode not in ("full", "pareto"):
+        raise ValueError(
+            f"legend_mode must be 'full' or 'pareto', got {legend_mode!r}"
+        )
+
+    save_paths = [Path(p) for p in save_paths]
+    if gamma_labels is None:
+        gamma_labels = [_parse_gamma_label_from_save_path(p) for p in save_paths]
+    if len(gamma_labels) != len(save_paths):
+        raise ValueError(
+            f"gamma_labels length ({len(gamma_labels)}) must match "
+            f"save_paths ({len(save_paths)})"
+        )
+
+    frames = []
+    for save_path, gamma_label in zip(save_paths, gamma_labels):
+        frame = collect_experiment_summaries(
+            save_path=str(save_path),
+            experiments=experiments,
+            experiment_glob=experiment_glob,
+            num_runs=num_runs,
+            x_col=x_col,
+            y_col=y_col,
+        )
+        frame = frame.copy()
+        frame["gamma_label"] = gamma_label
+        frames.append(frame)
+    df = pd.concat(frames, ignore_index=True)
+
+    if xlabel is None:
+        if x_col in ("FLOPs", "FLOPs_realized", "FLOPs_theoretical"):
+            xlabel = "FLOPs"
+        elif x_col == "Sparse Parameters":
+            xlabel = "Sparse parameter count"
+        elif x_col == "Dense Parameters":
+            xlabel = "Dense parameter count"
+        else:
+            xlabel = "Parameter count"
+    if ylabel is None:
+        ylabel = y_col
+    if title is None:
+        title = f"{ylabel} vs parameter count by growth rate"
+
+    resolved_y_goal = pareto_y_goal or _infer_pareto_y_goal(y_col, ylabel)
+    color_map = _default_gamma_color_map(gamma_labels, gamma_colors=gamma_colors)
+    kinds = tuple(pareto_frontier_kinds)
+    resolved_pareto_linestyle = _resolve_pareto_linestyle(
+        pareto_linestyle, kind="plasticity", junctures_mode="both"
+    )
+
+    fig, ax = plt.subplots(figsize=figsize)
+    pareto_handles = []
+    grouped = None
+
+    if aggregate_runs:
+        grouped = (
+            df.groupby(["gamma_label", "experiment"], dropna=False)
+            .agg(
+                x_mean=("x", "mean"),
+                x_std=("x", "std"),
+                y_mean=("y", "mean"),
+                y_std=("y", "std"),
+                kind=("kind", "first"),
+                n_runs=("run", "nunique"),
+            )
+            .reset_index()
+        )
+        plot_source = grouped
+        x_plot_col, y_plot_col = "x_mean", "y_mean"
+    else:
+        plot_source = df
+        x_plot_col, y_plot_col = "x", "y"
+
+    if show_points and aggregate_runs and grouped is not None:
+        for _, row in grouped.iterrows():
+            if row["kind"] not in kinds:
+                continue
+            color = color_map[row["gamma_label"]]
+            ax.errorbar(
+                row["x_mean"],
+                row["y_mean"],
+                xerr=row["x_std"] if pd.notna(row["x_std"]) else None,
+                yerr=row["y_std"] if pd.notna(row["y_std"]) else None,
+                fmt="o",
+                color=color,
+                markerfacecolor=color,
+                markeredgecolor=color,
+                markeredgewidth=1.0,
+                markersize=8,
+                capsize=3,
+                linestyle="none",
+                alpha=0.95,
+                zorder=2,
+            )
+        for _, row in df.iterrows():
+            if row["kind"] not in kinds:
+                continue
+            color = color_map[row["gamma_label"]]
+            ax.scatter(
+                row["x"],
+                row["y"],
+                color=color,
+                alpha=alpha_individual,
+                s=marker_size * 0.5,
+                zorder=1,
+            )
+
+    for gamma_label in gamma_labels:
+        color = color_map[gamma_label]
+        subset = plot_source[
+            (plot_source["gamma_label"] == gamma_label)
+            & (plot_source["kind"].isin(kinds))
+        ]
+        if subset.empty:
+            continue
+
+        if show_points and not aggregate_runs:
+            ax.scatter(
+                subset[x_plot_col],
+                subset[y_plot_col],
+                color=color,
+                alpha=alpha_individual,
+                s=marker_size * 0.5,
+                zorder=2,
+            )
+
+        pareto_df = subset.rename(columns={x_plot_col: "x", y_plot_col: "y"})
+        handle = _draw_pareto_frontier(
+            ax,
+            pareto_df,
+            color=color,
+            label=f"{gamma_label} Pareto",
+            y_goal=resolved_y_goal,
+            linestyle=resolved_pareto_linestyle,
+            linewidth=pareto_linewidth,
+        )
+        if handle is not None:
+            pareto_handles.append(handle)
+
+    if legend_mode == "full":
+        point_handles = []
+        for gamma_label in gamma_labels:
+            if gamma_label not in df["gamma_label"].values:
+                continue
+            color = color_map[gamma_label]
+            point_handles.append(
+                Line2D(
+                    [0],
+                    [0],
+                    marker="o",
+                    color="w",
+                    markerfacecolor=color,
+                    markeredgecolor=color,
+                    markersize=8,
+                    label=gamma_label,
+                )
+            )
+        handles = point_handles + pareto_handles
+        legend_title = "Growth mode / Pareto"
+    else:
+        handles = list(pareto_handles)
+        legend_title = "Pareto"
+
+    if handles:
+        legend_kwargs = {"handles": handles, "title": legend_title}
+        if legend_fontsize is not None:
+            legend_kwargs["fontsize"] = legend_fontsize
+            legend_kwargs["title_fontsize"] = legend_fontsize
+        ax.legend(**legend_kwargs)
+
+    ax.set_xlabel(xlabel, fontsize=axis_label_fontsize)
+    ax.set_ylabel(ylabel, fontsize=axis_label_fontsize)
+    if x_tick_interval is not None:
+        from matplotlib.ticker import MultipleLocator
+
+        ax.xaxis.set_major_locator(MultipleLocator(float(x_tick_interval)))
+    if tick_label_fontsize is not None:
+        ax.tick_params(axis="both", labelsize=tick_label_fontsize)
+    ax.set_title(title, fontsize=title_fontsize)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    if save_path_out is not None:
+        out = Path(save_path_out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(out, dpi=dpi, bbox_inches="tight")
     if show:
         plt.show()
     else:
