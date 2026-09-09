@@ -1012,9 +1012,7 @@ def main(
     global_prune_budget = "neurons"  # "params" or "neurons"
     global_prune_normalize = "mad"  # "percentile", "zscore", "mad", or "raw"
 
-    # warm_start_steps = 64 #if dataset == "fashion_mnist" else 32
     warm_start_lr = learning_rate * 0.4 
-    # grow_new_only_steps = 16 #if dataset == "fashion_mnist" else 8
     
     # Create results directory
     os.makedirs(f'{save_path}', exist_ok=True)
@@ -1173,93 +1171,7 @@ def main(
         )
 
 if __name__ == "__main__":
-    hidden_sizes = [500, 500]
-    for hidden_size in [[20,20],[50,50],[100,100],[200,200],[500,500]]:
-        for lambda_penalty in [0,1e-07,5e-07,1e-06,5e-06]:
-            for junctures_mode in ["both"]:
-                for i in range(1, 6):
-                    set_seed(SEED+i)
-                    print("Running Fashion experiment for run", i, f"(junctures_mode={junctures_mode})")
-                    main(
-                        f"results_fashionmnist/run_{i}",
-                        hidden_sizes,
-                        lambda_penalty,
-                        junctures_mode=junctures_mode,
-                        dataset="fashion_mnist",
-                        run_mode="plasticity",
-                    )
+    pass
 
 
-    hidden_sizes = [500, 500]
-    for lambda_penalty in [0,1e-07,5e-07,1e-06,5e-06]:
-        for junctures_mode in ["prune"]:
-            for i in range(1, 6):
-                set_seed(SEED+i)
-                print("Running Fashion experiment for run", i, f"(junctures_mode={junctures_mode})")
-                main(
-                    f"results_fashionmnist/run_{i}",
-                    hidden_sizes,
-                    lambda_penalty,
-                    junctures_mode=junctures_mode,
-                    dataset="fashion_mnist",
-                    run_mode="plasticity",
-                )
-
-
-    for hidden_size in [[20,20],[50,50],[100,100],[150,150],[200,200]]:
-        for lambda_penalty in [0]:
-            for junctures_mode in ["both"]:
-                for i in range(1,6):
-                    set_seed(SEED+i)
-                    print("Running experiment for run", i, f"(junctures_mode={junctures_mode})")
-                    main(
-                        f"results_fashionmnist/run_{i}",
-                        hidden_size,
-                        lambda_penalty,
-                        junctures_mode=junctures_mode,
-                        dataset="fashion_mnist",
-                        run_mode="baseline",
-                    )
-    print("All experiments completed.")
-
-
-
-    for hidden_size in [[200,200],[150,150],[100,100],[50,50],[20,20]]:
-        for lambda_penalty in [0]:
-            for junctures_mode in ["both"]:
-                for i in range(1,6):
-                    set_seed(SEED+i)
-                    print("Running experiment for run", i, f"(junctures_mode={junctures_mode})")
-                    main(
-                        f"results_fashionmnist/run_{i}",
-                        hidden_size,
-                        lambda_penalty,
-                        junctures_mode=junctures_mode,
-                        dataset="fashion_mnist",
-                        run_mode="three_phase",
-                        three_phase_growth_layer_idx=1,
-                        three_phase_growth_gamma=1,
-                    )
-    print("All experiments completed.")
-
-    for lambda_penalty in [0,1e-07,5e-07,1e-06,5e-06]:
-        for i in range(1, 6):
-            set_seed(SEED+i)
-            plasticity_dir = (
-                f"results_fashionmnist/run_{i}/plasticity_500_{_format_lambda_dir(lambda_penalty)}"
-            )
-            print(
-                "Running static replay for run",
-                i,
-                f"(source={plasticity_dir})",
-            )
-            main(
-                f"results_fashionmnist/run_{i}",
-                [500, 500],  # unused for architecture; taken from plasticity summary
-                lambda_penalty=0,
-                dataset="fashion_mnist",
-                run_mode="static_replay",
-                resume_from_plasticity_dir=plasticity_dir,
-            )
-    print("All static replay experiments completed.")
 

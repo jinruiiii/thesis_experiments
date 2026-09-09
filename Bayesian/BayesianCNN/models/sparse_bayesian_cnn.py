@@ -1,5 +1,3 @@
-"""Sparse Bayesian CNN layers and NeST growth/prune operators (Policies 1, 3, 4.3.1)."""
-
 from __future__ import annotations
 
 import copy

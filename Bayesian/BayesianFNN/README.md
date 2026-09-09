@@ -1,52 +1,48 @@
 # Bayesian FNN experiments
 
-Code for the Bayesian fully-connected network experiments (structural plasticity, NeST, and Fashion-MNIST prior shift).
+Code for the Bayesian fully-connected network experiments.
 
 Run **all commands from this directory** (`thesis_experiments/Bayesian/BayesianFNN`).
 
 ## Setup
 
 ```bash
-pip install -r requirements.txt
+pip install -r ../requirements.txt
 ```
 
-Datasets are read from `../../Datasets` (Fashion-MNIST / KMNIST via torchvision, `download=True`). That folder is gitignored.
+Datasets are read from `../../Datasets` (Fashion-MNIST / CIFAR-10 via torchvision, `download=True`). That folder is gitignored.
 
-Experiment outputs under `results*` / `results_*/` are also gitignored (see `thesis_experiments/.gitignore`: `**/results/`, `**/results*/`) and are **not** pushed to GitHub. Regenerate them locally by running the experiments and `python -m scripts.make_figures`.
+Experiment outputs under `results*` / `results_*/` are also gitignored (see `thesis_experiments/.gitignore`: `**/results/`, `**/results*/`) and are **not** pushed to GitHub.
 
 ## Seed contract
 
 - Sweeps call `set_seed(42 + i)` for runs `i = 1..5`, then `main(...)`.
 
-## Experiments
+## Reproduce experiments
 
-| Thesis comparison | Module | Typical invocation |
-|---|---|---|
-| Baseline / plasticity / three-phase / static replay | `experiments.run_plasticity` | `python -m experiments.run_plasticity` |
-| NeST | `experiments.run_nest` | `python -m experiments.run_nest` |
-| Prior shift (VCL) | `experiments.run_shift` | `python -m experiments.run_shift` |
-
-`experiments.run_plasticity.main(..., run_mode=...)` selects `baseline`, `plasticity`, `three_phase`, or `static_replay`.
-
-### Plasticity knobs
-
-- `junctures_mode`: `both`, `grow`, `prune`, or `both_gp`
-- Growth layer score: `mean` or `mad` (`growth_mad_percentile`)
-- Prune: `prune_mode="global_param"` with `global_prune_normalize` in `{percentile, zscore, mad, raw}` and budget `neurons` / `params`
-- `static_replay` requires `resume_from_plasticity_dir` (reads `Hidden Sizes` from that run’s `experiment_summary.csv`)
-
-## Figures
-
-From saved `experiment_summary.csv` trees (no retraining):
+### Fashion-MNIST FNN
 
 ```bash
-python -m scripts.make_figures
+python -m scripts.script_fashionmnist
 ```
 
-This writes:
+After results are written under `results_fashionmnist/` (and related trees), build plots:
 
-- Fashion-MNIST Pareto / param plots from `results_fashionmnist/`: `results_fashionmnist_acc.png`, `results_fashionmnist_brier.png`, `results_fashionmnist_param_count_vs_epoch.png`
-- Prior-shift decision heatmap from `results_prior_shift_fashionmnist/`: `decision_heatmap.png`
+```bash
+python -m scripts.make_figures_fashionmnist
+```
+
+### CIFAR-10 FNN
+
+```bash
+python -m scripts.script_cifar10
+```
+
+After results are written under `results_cifar10/` (and related trees), build plots:
+
+```bash
+python -m scripts.make_figures_cifar10
+```
 
 ## Layout
 
@@ -54,5 +50,5 @@ This writes:
 models/       BayesianFNN and sparse NeST layers
 lib/          seed, data, train/eval, grow/prune, FLOPs, plots
 experiments/  plasticity, NeST, and prior-shift runners
-scripts/      figure assembly from saved summaries
+scripts/      experiment sweeps and figure assembly
 ```

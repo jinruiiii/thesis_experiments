@@ -38,7 +38,6 @@ def write_nest_experiment_summary_csv(
     test_acc,
     test_brier,
 ):
-    """Write Nest summary with sparse/dense variational param counts (no legacy Parameters)."""
     summary_df = pd.DataFrame(
         [
             {
@@ -477,16 +476,6 @@ def main(
     prune_retrain_epochs=3,
     dataset="fashion_mnist",
 ):
-    """
-    dataset options:
-      - "fashion_mnist": Fashion-MNIST (default)
-      - "kmnist": Kuzushiji-MNIST
-      - "cifar10": CIFAR-10 greyscale (1024-dim input)
-
-    When using cifar10, set reference_acc and prune_acc_floor to values
-    appropriate for that dataset (Fashion-MNIST thresholds like 89% will not
-    work sensibly).
-    """
     if dataset not in SUPPORTED_DATASETS:
         raise ValueError(
             f"dataset must be one of {sorted(SUPPORTED_DATASETS)}, got {dataset!r}"
@@ -585,47 +574,5 @@ def main(
 
 
 if __name__ == "__main__":
-
-    # for prune_acc_floor in [89.0, 88.5, 88.0, 87.5, 87.0]:
-    #     for i in range(1, 6):
-    #         set_seed(SEED + i)
-    #         main(
-    #             f"results_fashionmnist/run_{i}",
-    #             hidden_sizes=(300, 100),
-    #             dataset="fashion_mnist",
-    #             seed_scale=1,
-    #             seed_activate_frac=0.1,
-    #             reference_acc=89.0,
-    #             prune_acc_floor=prune_acc_floor,
-    #             max_growth_epochs=60,
-    #             grow_interval=2,
-    #             conn_grow_frac=0.01,
-    #             beta_growth=0.4,
-    #             birth_strength=0.4,
-    #             prune_frac=0.01,
-    #             max_prune_rounds=200,
-    #             prune_retrain_epochs=2,
-    #         )
-
-    for prune_acc_floor in [44.0, 43.5, 43.0, 42.5, 42.0]:
-        for i in range(1, 6):
-            set_seed(SEED + i)
-            main(
-                f"results_cifar10_plasticity_0.1_ws64_gn32/run_{i}",
-                hidden_sizes=(300, 100),
-                dataset="cifar10",
-                seed_scale=1,
-                seed_activate_frac=0.1,
-                reference_acc=44.0,
-                prune_acc_floor=prune_acc_floor,
-                max_growth_epochs=60,
-                grow_interval=2,
-                conn_grow_frac=0.01,
-                beta_growth=0.4,
-                birth_strength=0.4,
-                prune_frac=0.01,
-                max_prune_rounds=500,
-                prune_retrain_epochs=2,
-            )
-
+    pass
 

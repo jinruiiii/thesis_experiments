@@ -21,7 +21,7 @@ if __name__ == "__main__":
     ]
 
     _cifar_dynamic_experiments = [
-        "three_phase_baseline_20","three_phase_baseline_50","three_phase_baseline_100","three_phase_baseline_150","three_phase_baseline_200",
+        "three_phase_baseline_30","three_phase_baseline_50","three_phase_baseline_100","three_phase_baseline_150","three_phase_baseline_200",
         "plasticity_500_5e-06", "plasticity_500_1e-06", "plasticity_500_5e-07",
         "plasticity_500_1e-07", "plasticity_500_0",
         "nest_300_100_p0.1_refacc44_flooracc42",
@@ -40,21 +40,13 @@ if __name__ == "__main__":
         "plasticity_500_0_prune_only",
         "static_replay_500_5e-06", "static_replay_500_1e-06",
         "static_replay_500_5e-07", "static_replay_500_1e-07", "static_replay_500_0",
-        "three_phase_baseline_20","three_phase_baseline_50","three_phase_baseline_100","three_phase_baseline_150","three_phase_baseline_200",
+        "three_phase_baseline_30","three_phase_baseline_50","three_phase_baseline_100","three_phase_baseline_150","three_phase_baseline_200",
         "nest_300_100_p0.1_refacc44_flooracc42",
         "nest_300_100_p0.1_refacc44_flooracc42.5",
         "nest_300_100_p0.1_refacc44_flooracc43",
         "nest_300_100_p0.1_refacc44_flooracc43.5",
         "nest_300_100_p0.1_refacc44_flooracc44",
 
-    ]
-
-    _cifar_shift_experiments = [
-        "baseline_50_vcl", "baseline_100_vcl", "baseline_150_vcl", "baseline_200_vcl",
-        "plasticity_500_5e-06_vcl", "plasticity_500_1e-06_vcl", "plasticity_500_5e-07_vcl",
-        "plasticity_500_1e-07_vcl", "plasticity_500_0_vcl",
-        "static_replay_500_5e-06_vcl", "static_replay_500_1e-06_vcl",
-        "static_replay_500_5e-07_vcl", "static_replay_500_1e-07_vcl", "static_replay_500_0_vcl",
     ]
 
     _cifar_pareto_kinds = (
@@ -166,64 +158,3 @@ if __name__ == "__main__":
         show=False,
     )
 
-    _cifar_plasticity_experiments = [
-        # uncertainty growth (under results_cifar10)
-        "plasticity_500_0",
-        "plasticity_500_1e-07",
-        "plasticity_500_5e-07",
-        "plasticity_500_1e-06",
-        "plasticity_500_5e-06",
-        # random growth (under results_cifar10_plasticity_random_growth)
-        "plasticity_500_0_random_grow",
-        "plasticity_500_1e-07_random_grow",
-        "plasticity_500_5e-07_random_grow",
-        "plasticity_500_1e-06_random_grow",
-        "plasticity_500_5e-06_random_grow",
-    ]
-    plot_gamma_pareto_comparison(
-        save_paths=[
-            "results_cifar10",
-            "results_cifar10_plasticity_random_growth",
-        ],
-        gamma_labels=["Uncertainty growth", "Random growth"],
-        experiments=_cifar_plasticity_experiments,
-        num_runs=5,
-        y_col="Test Acc",
-        ylabel="Test Acc",
-        title="Test Acc vs Parameter Count",
-        xlabel="Parameter Count",
-        show_points=True,
-        legend_mode="pareto",
-        axis_label_fontsize=20,
-        tick_label_fontsize=20,
-        title_fontsize=20,
-        legend_fontsize=20,
-        pareto_linewidth=5,
-        x_tick_interval=100_000,
-        save_path_out="cifar10_plots/random_growth/brier.pdf",
-        show=False,
-    )
-
-    plot_gamma_pareto_comparison(
-        save_paths=[
-            "results_cifar10",
-            "results_cifar10_plasticity_random_growth",
-        ],
-        gamma_labels=["Uncertainty growth", "Random growth"],
-        experiments=_cifar_plasticity_experiments,
-        num_runs=5,
-        y_col="Test Brier",
-        ylabel="Test Brier",
-        title="Test Brier vs Parameter Count",
-        xlabel="Parameter Count",
-        show_points=True,
-        legend_mode="pareto",
-        axis_label_fontsize=20,
-        tick_label_fontsize=20,
-        title_fontsize=20,
-        legend_fontsize=20,
-        pareto_linewidth=5,
-        x_tick_interval=100_000,
-        save_path_out="cifar10_plots/random_growth/acc.pdf",
-        show=False,
-    )

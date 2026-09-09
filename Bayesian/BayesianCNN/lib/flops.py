@@ -1,5 +1,3 @@
-"""Post-hoc CNN FLOPs helpers for NeST complexity plots."""
-
 from __future__ import annotations
 
 import ast

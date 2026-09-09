@@ -1,26 +1,3 @@
-"""
-Fashion-MNIST prior-shift experiment (class-proportion flip).
-
-Phase 1 train/val: ~90% on group A (Trouser, Sandal, Sneaker, Bag, Ankle boot),
-                   ~10% on group B (T-shirt, Pullover, Dress, Coat, Shirt).
-Phase 2: proportions swapped.
-
-Protocol:
-  - Train Phase 1 for a conservative number of epochs.
-  - Select best Phase-1 checkpoint on Phase-1-matched val.
-  - Rewind to that checkpoint, switch loaders, continue Phase 2.
-  - Optional (phase2_vcl_prior): freeze Phase-1 posterior as the KL prior for Phase 2.
-  - Optional (phase2_regrow_to_init): expand hidden layers back to the original
-    init widths before Phase-2 training (copy old weights; new neurons random).
-  - Select best Phase-2 checkpoint on Phase-2-matched val for final eval.
-  - Report balanced-test, Phase-2-matched, and Phase-1-matched (@P1/@P2) metrics for forgetting.
-
-run_mode:
-  - "plasticity": adaptive grow/prune (lambda sweep for Pareto).
-  - "baseline": same-start static (no structural junctures, lambda=0).
-  - "static_replay": fixed widths from a plasticity experiment_summary.csv.
-"""
-
 from __future__ import annotations
 
 import copy
@@ -109,12 +86,6 @@ def _indices_for_prior(
     majority_frac,
     rng,
 ):
-    """
-    Subsample candidate_idx so majority_group classes form ~majority_frac of the set.
-
-    Takes all majority-group samples available in candidate_idx, then samples enough
-    minority-group samples so minority_frac = 1 - majority_frac.
-    """
     majority_group = set(int(c) for c in majority_group)
     cand = np.asarray(candidate_idx, dtype=np.int64)
     y = labels.numpy() if torch.is_tensor(labels) else np.asarray(labels)

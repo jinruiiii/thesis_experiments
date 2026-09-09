@@ -190,22 +190,6 @@ if __name__ == "__main__":
         yoffset_fontsize=20,
     )
 
-    plot_param_count(
-        save_path="results_fashionmnist_different_initial",
-        experiments= ["plasticity_500_1e-07", "plasticity_200_1e-07", "plasticity_100_1e-07", "plasticity_50_1e-07", "plasticity_20_1e-07"],
-        show_individual=False,
-        show_checkpoint=True,
-        checkpoint_tail_epochs=5,
-        save_path_out="fashionmnist_plots/structure/param_count_vs_epoch_diff_initial.pdf",
-        axis_label_fontsize=20,
-        tick_label_fontsize=20,
-        title_fontsize=20,
-        legend_fontsize=20,
-        show=True,
-        yoffset_fontsize=20,
-    )
-
-
     plot_structural_decision_heatmap(
         save_path="results_fashionmnist",
         experiments=_experiments,

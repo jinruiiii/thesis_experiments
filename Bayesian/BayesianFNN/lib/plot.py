@@ -12,6 +12,12 @@ from matplotlib.patches import Patch
 
 from lib.flops import parse_hidden_sizes
 
+
+def _ensure_parent_dir(path):
+    parent = Path(path).expanduser().resolve().parent
+    parent.mkdir(parents=True, exist_ok=True)
+
+
 def plot_metrics(metrics_dict, save_path='./results/metrics_comparison.png'):
     """Plot comparison of metrics across all models"""
     # Define colors for each model
@@ -124,6 +130,7 @@ def plot_metrics(metrics_dict, save_path='./results/metrics_comparison.png'):
     ax.legend()
     
     plt.tight_layout()
+    _ensure_parent_dir(save_path)
     plt.savefig(save_path)
     plt.close()
 
@@ -363,6 +370,7 @@ def plot_param_count(
     if save_path_out is None:
         tag = "_".join(experiments[0].split("_")[1:3]) if len(experiments) == 1 else "multi"
         save_path_out = f"param_count_{tag}.png"
+    _ensure_parent_dir(save_path_out)
     fig.savefig(save_path_out, dpi=dpi)
 
     if show:
@@ -704,6 +712,7 @@ def plot_structural_decision_heatmap(
 
     if save_path_out is None:
         save_path_out = "structural_decision_heatmap.png"
+    _ensure_parent_dir(save_path_out)
     fig.savefig(save_path_out, dpi=dpi, bbox_inches="tight")
 
     if show:
@@ -2348,6 +2357,7 @@ def plot_param_count_vs_test_acc(
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
     if save_path_out is not None:
+        _ensure_parent_dir(save_path_out)
         fig.savefig(save_path_out, dpi=dpi, bbox_inches="tight")
     if show:
         plt.show()
@@ -2629,6 +2639,7 @@ def plot_gamma_pareto_comparison(
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
     if save_path_out is not None:
+        _ensure_parent_dir(save_path_out)
         fig.savefig(save_path_out, dpi=dpi, bbox_inches="tight")
     if show:
         plt.show()

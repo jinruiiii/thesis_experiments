@@ -1,26 +1,3 @@
-"""
-CIFAR-10 prior-shift experiment (class-proportion flip).
-
-Phase 1 train/val: ~90% on group A (vehicles: airplane, automobile, ship, truck),
-                   ~10% on group B (animals).
-Phase 2: proportions swapped.
-
-Protocol:
-  - Train Phase 1 for a conservative number of epochs.
-  - Select best Phase-1 checkpoint on Phase-1-matched val.
-  - Rewind to that checkpoint, switch loaders, continue Phase 2.
-  - Optional (phase2_vcl_prior): freeze Phase-1 posterior as the KL prior for Phase 2.
-  - Optional (phase2_regrow_to_init): expand conv layers back to the original
-    init channel widths before Phase-2 training (copy old weights; new filters random).
-  - Select best Phase-2 checkpoint on Phase-2-matched val for final eval.
-  - Report balanced-test, Phase-2-matched, and Phase-1-matched (@P1/@P2) metrics for forgetting.
-
-run_mode:
-  - "plasticity": adaptive grow/prune (lambda sweep for Pareto).
-  - "baseline": same-start static (no structural junctures, lambda=0).
-  - "static_replay": fixed widths from a plasticity experiment_summary.csv.
-"""
-
 from __future__ import annotations
 
 import copy

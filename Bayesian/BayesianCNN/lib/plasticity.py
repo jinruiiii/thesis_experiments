@@ -1,4 +1,3 @@
-"""Filter-level growth/pruning for BayesianCNN (FNN-parity options)."""
 import copy
 import math
 import random

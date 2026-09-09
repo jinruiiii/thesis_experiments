@@ -1,5 +1,3 @@
-"""Post-hoc FNN FLOPs helpers for Acc vs complexity plots (no retraining)."""
-
 from __future__ import annotations
 
 import ast

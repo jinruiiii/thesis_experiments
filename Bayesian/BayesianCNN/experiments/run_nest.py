@@ -575,19 +575,4 @@ def main(
 
 
 if __name__ == "__main__":
-    set_seed(SEED)
-    main(
-        save_path="results_nest_cnn_smoke",
-        conv_channels=(8, 8),
-        seed_activate_frac=0.2,
-        reference_acc=15.0,
-        prune_acc_floor=12.0,
-        max_growth_epochs=2,
-        grow_interval=1,
-        max_prune_rounds=1,
-        prune_retrain_epochs=1,
-        dataset="cifar10",
-        cifar10_grayscale=True,
-        batch_size=64,
-        num_feature_candidates=3,
-    )
+    pass
